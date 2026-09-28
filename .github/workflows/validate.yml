@@ -1,0 +1,110 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Required files exist
+        run: |
+          echo "==> Required files"
+          for f in \
+            build-yandex.ps1 \
+            update.bat \
+            debloater.reg \
+            chrome++.ini \
+            README.md \
+            docs/plans/2026-09-27-yandex-browser-portable-design.md
+          do
+            if [ ! -f "$f" ]; then
+              echo "  MISSING: $f"
+              exit 1
+            fi
+            echo "  OK: $f"
+          done
+
+      - name: Debloater has exactly the safe 11 policy keys
+        run: |
+          echo "==> debloater.reg: safe-11 keys"
+          # Per-key UpdateAllowed security rationale lives in the reg comments
+          # (review fix #22) — not in this workflow.
+          for key in \
+            StatisticsReporting \
+            CrashesReporting \
+            BackgroundModeEnabled \
+            YandexAutoLaunchMode \
+            YandexAliceMsgDisable \
+            NeuroNtpTools \
+            NtpNotificationsDisable \
+            YandexButtonDisable \
+            SearchSuggestEnabled \
+            UpdateAllowed \
+            BackgroundUpdateAllowed
+          do
+            if ! grep -qF "\"$key\"=dword" debloater.reg; then
+              echo "  MISSING key: $key"
+              exit 1
+            fi
+            echo "  OK: $key"
+          done
+          COUNT=$(grep -c 'dword' debloater.reg)
+          if [ "$COUNT" -ne 11 ]; then
+            echo "  ERROR: expected exactly 11 dword values, found $COUNT"
+            exit 1
+          fi
+          echo "  dword count: $COUNT"
+
+      - name: Never-touch guards
+        run: |
+          echo "==> 3-don't-touch guards"
+          if grep -qE '"(SafeBrowsingProtectionLevel|ComponentUpdatesEnabled)"=' debloater.reg; then
+            echo "  ERROR: forbidden security/DRM key present in debloater.reg"
+            exit 1
+          fi
+          if grep -q 'disable-component-update' chrome++.ini; then
+            echo "  ERROR: --disable-component-update must never ship (breaks Widevine/DRM)"
+            exit 1
+          fi
+          if grep -qF 'Policies\Chromium' debloater.reg; then
+            echo "  ERROR: Yandex reads Policies\YandexBrowser, not Policies\Chromium"
+            exit 1
+          fi
+          echo "  OK: no forbidden keys"
+
+      - name: chrome plus ini portability pins
+        run: |
+          echo "==> chrome++.ini pins"
+          if ! grep -qF 'data_dir=%app%\..\Data' chrome++.ini; then
+            echo "  ERROR: data_dir must be %app%\..\Data (portable root)"
+            exit 1
+          fi
+          if ! grep -qF 'cache_dir=%app%\..\Cache' chrome++.ini; then
+            echo "  ERROR: cache_dir must be %app%\..\Cache (portable root)"
+            exit 1
+          fi
+          echo "  Paths: OK"
+
+      - name: Debloater registry header
+        run: |
+          echo "==> debloater.reg header"
+          if ! grep -q 'Windows Registry Editor' debloater.reg; then
+            echo "  ERROR: missing Windows Registry Editor header"
+            exit 1
+          fi
+          echo "  Header: OK"
+
+      - name: Workflow files present
+        run: |
+          echo "==> Workflows"
+          # Only validate.yml is pinned here; build/smoke workflow pins are
+          # added later by Tasks 6/7 — do not pin them in this task.
+          if [ ! -f .github/workflows/validate.yml ]; then
+            echo "  MISSING: .github/workflows/validate.yml"
+            exit 1
+          fi
+          echo "  OK: .github/workflows/validate.yml"
