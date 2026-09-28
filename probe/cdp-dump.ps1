@@ -26,8 +26,10 @@ try {
   if (-not $Profile) { $Profile = Join-Path ([IO.Path]::GetTempPath()) ('cdp-' + [Guid]::NewGuid().ToString('N')) }
 
   if (-not $NoLaunch) {
-    $argList = $Base + @("--user-data-dir=$Profile", "--remote-debugging-port=$Port", '--remote-allow-origins=*', $Url)
-    Log "launch browser.exe port=$Port url=$Url"
+    $launchUrl = $Url
+    if ($DriveNav) { $launchUrl = 'about:blank' }
+    $argList = $Base + @("--user-data-dir=$Profile", "--remote-debugging-port=$Port", '--remote-allow-origins=*', $launchUrl)
+    Log "launch browser.exe port=$Port url=$launchUrl"
     $proc = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -WorkingDirectory $App `
       -RedirectStandardOutput "$OutFile.out" -RedirectStandardError "$OutFile.err"
   }
@@ -66,7 +68,11 @@ try {
         $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/json/list" -UseBasicParsing -TimeoutSec 3
         $list = @($r.Content | ConvertFrom-Json)
         $pages = @($list | Where-Object { $_.type -eq 'page' })
-        if ($pages.Count -gt 0) { return $pages[0] }
+        if ($pages.Count -gt 0) {
+          $live = @($pages | Where-Object { $_.url })
+          if ($live.Count -gt 0) { return $live[0] }
+          return $pages[0]
+        }
         $last = 'no page targets'
       } catch { $last = $_.Exception.Message }
     }
