@@ -11,7 +11,8 @@ param(
   [string]$AwaitExpr = '',
   [int]$AwaitMs = 0,
   [int]$PollMs = 1000,
-  [switch]$NoLaunch
+  [switch]$NoLaunch,
+  [switch]$DriveNav
 )
 $ErrorActionPreference = 'Stop'
 function Log([string]$m) { Write-Host "detail: cdp-dump: $m" }
@@ -56,8 +57,32 @@ try {
     Log "no url-matched target within ${ReadyMs}ms (last=$last)"
     return $null
   }
-  $target = Find-Target
-  if ($null -eq $target) { exit 3 }
+  function Get-AnyPage([int]$timeoutMs) {
+    $dl = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
+    $last = ''
+    while ([DateTime]::UtcNow -lt $dl) {
+      Start-Sleep -Milliseconds $PollMs
+      try {
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/json/list" -UseBasicParsing -TimeoutSec 3
+        $list = @($r.Content | ConvertFrom-Json)
+        $pages = @($list | Where-Object { $_.type -eq 'page' })
+        if ($pages.Count -gt 0) { return $pages[0] }
+        $last = 'no page targets'
+      } catch { $last = $_.Exception.Message }
+    }
+    Log "no page target within ${timeoutMs}ms (last=$last)"
+    return $null
+  }
+  $driveNav = $false
+  if ($DriveNav) {
+    $target = Get-AnyPage 8000
+    if ($null -eq $target) { exit 3 }
+    $driveNav = $true
+    Log 'DriveNav: attaching to first page target; navigation will be driven over CDP'
+  } else {
+    $target = Find-Target
+    if ($null -eq $target) { exit 3 }
+  }
   Log "target url=$($target.url)"
 
   function Send-Json([string]$json) {
@@ -107,6 +132,27 @@ try {
     catch { Log "Runtime.enable attempt ${attempt}: $($_.Exception.Message)"; if ($attempt -lt 2) { Start-Sleep -Seconds 3 } }
   }
   if (-not $enabled) { throw 'Runtime.enable failed after 2 attempts' }
+
+  if ($driveNav) {
+    $null = Invoke-Cdp 'Page.enable' @{}
+    $null = Invoke-Cdp 'Page.navigate' @{ url = $Url }
+    Log "Page.navigate issued for $Url"
+    $loc = ''
+    $prefix = $Url.TrimEnd('/')
+    $locLimit = [DateTime]::UtcNow.AddSeconds(15)
+    while ([DateTime]::UtcNow -lt $locLimit) {
+      Start-Sleep -Milliseconds $PollMs
+      try {
+        $r = Invoke-Cdp 'Runtime.evaluate' @{ expression = 'location.href'; returnByValue = $true }
+        if ($null -ne $r.result -and $null -ne $r.result.result -and $null -ne $r.result.result.PSObject.Properties['value']) {
+          $loc = [string]$r.result.result.value
+        }
+        if (($loc -eq $Url) -or $loc.StartsWith($prefix)) { break }
+      } catch { Log "loc poll: $($_.Exception.Message)" }
+    }
+    Log "navigated location.href=[$loc]"
+    if (($loc -ne $Url) -and (-not $loc.StartsWith($prefix))) { throw "navigation to $Url did not commit (location.href=$loc)" }
+  }
 
   try { $null = Invoke-Cdp 'Runtime.enable' @{} } catch { Log "Runtime.enable: $($_.Exception.Message)" }
 

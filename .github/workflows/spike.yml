@@ -358,7 +358,7 @@ jobs:
               )
               foreach ($t in $tries) {
                 $cdpOut = Join-Path $env:SPIKE "p3a-cdp-$($t.Port).html"
-                & $cdpScript -App $appDir -Url $t.Url -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE "profiles\p3a-cdp-$($t.Port)") -Port $t.Port -ReadyMs $t.Ready
+                & $cdpScript -App $appDir -Url $t.Url -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE "profiles\p3a-cdp-$($t.Port)") -Port $t.Port -ReadyMs $t.Ready -DriveNav
                 $cdpExit = $LASTEXITCODE
                 $cdom = $null
                 if (Test-Path $cdpOut) { $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue }
@@ -623,7 +623,7 @@ jobs:
               )
               foreach ($t in $tries) {
                 $cdpOut = Join-Path $env:SPIKE "p3b-cdp-$($t.Port).html"
-                & $cdpScript -App $appDir -Url $t.Url -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE "profiles\p3b-cdp-$($t.Port)") -Port $t.Port -ReadyMs $t.Ready
+                & $cdpScript -App $appDir -Url $t.Url -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE "profiles\p3b-cdp-$($t.Port)") -Port $t.Port -ReadyMs $t.Ready -DriveNav
                 $cdpExit = $LASTEXITCODE
                 $cdom = $null
                 if (Test-Path $cdpOut) { $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue }
