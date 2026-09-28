@@ -885,6 +885,24 @@ jobs:
                   $script:P3hNote = "devtools endpoint not reachable ($dt)"
                   return $false
                 }
+                # the browser can bind the devtools port before its first tab exists
+                # (profile lock contention after a relaunch) - wait for a real page
+                $np = 0
+                $pd = [DateTime]::UtcNow.AddSeconds(25)
+                while ([DateTime]::UtcNow -lt $pd) {
+                  try {
+                    $lr = Invoke-WebRequest -Uri "http://127.0.0.1:$port/json/list" -UseBasicParsing -TimeoutSec 3
+                    $np = @($lr.Content | ConvertFrom-Json | Where-Object { $_.type -eq 'page' }).Count
+                    if ($np -gt 0) { break }
+                  } catch { }
+                  Start-Sleep -Seconds 1
+                }
+                EmitDetail "P3h $tag devtools pages=$np"
+                if ($np -le 0) {
+                  Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+                  $script:P3hNote = 'devtools up but no page target after launch'
+                  return $false
+                }
                 return $true
               }
               function Get-PageUrls {
@@ -898,6 +916,9 @@ jobs:
                 if (-not $d -or $d.Length -lt 200) { return $false }
                 if ($shownUrl -notmatch 'policy') { return $false }
                 if ($d -match 'chrome-error|ERR_INVALID|ERR_FAILED|not reached') { return $false }
+                # mhtml carries MIME headers, so a dead/blank capture can still clear
+                # 200 bytes - a real policy page snapshot is always much larger
+                if ($d.StartsWith('MIME-Version') -and $d.Length -lt 1000) { return $false }
                 return $true
               }
               function Capture-Cdp([string]$u, [string]$stage, [int]$readyMs, [switch]$drive) {
@@ -911,10 +932,13 @@ jobs:
                 if ($null -ne $cdom) { $clen = $cdom.Length }
                 $actual = Get-PageUrls
                 EmitDetail "P3h $tag cdp[$stage] url=$u exit=$cdpExit dom bytes=$clen pageUrls=[$actual]"
-                $shown = $u
+                # only trust the requested url as the shown url when the target list is
+                # unavailable; a known non-policy target must never vouch for this dump
+                $shown = $null
                 $pol = @(($actual -split ', ') | Where-Object { $_ -match 'policy' })
                 if ($pol.Count -gt 0) { $shown = $pol[0] }
-                if (Test-Usable $shown $cdom) { $script:P3hNote = ''; return @{ url = $shown; dom = $cdom } }
+                elseif (-not $actual -or $actual -like 'error:*') { $shown = $u }
+                if ($null -ne $shown -and (Test-Usable $shown $cdom)) { $script:P3hNote = ''; return @{ url = $shown; dom = $cdom } }
                 $script:P3hNote = "$u[$stage] exit=$cdpExit bytes=$clen"
                 return $null
               }
@@ -926,7 +950,7 @@ jobs:
               }
               if (-not (Launch-Headed 'about:blank' '')) { return }
               $candidates = @()
-              foreach ($u in @('browser://policy/', 'chrome://policy/')) {
+              foreach ($u in @('chrome://policy/', 'browser://policy/')) {
                 $c = Capture-Cdp $u 's1' 30000 -drive
                 if ($null -ne $c) { $candidates += $c }
               }
@@ -943,7 +967,14 @@ jobs:
               if ($null -eq $best) {
                 EmitDetail "P3h $tag stage3: restart headed with chrome://policy/ as the startup URL so the commit happens before we attach"
                 Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 2
+                # wait for the old devtools port to actually die; relaunching while the
+                # dying instance still holds the profile lock yields a browser with
+                # zero tabs (json/list -> []) for tens of seconds
+                $pf = [DateTime]::UtcNow.AddSeconds(20)
+                while ([DateTime]::UtcNow -lt $pf) {
+                  try { $null = Invoke-WebRequest -Uri "http://127.0.0.1:$port/json/version" -UseBasicParsing -TimeoutSec 2; Start-Sleep -Milliseconds 500 } catch { break }
+                }
+                Start-Sleep -Seconds 3
                 if (Launch-Headed 'chrome://policy/' '-2') {
                   $c = Capture-Cdp 'chrome://policy/' 's3' 20000
                   if ($null -ne $c) { $candidates += $c }

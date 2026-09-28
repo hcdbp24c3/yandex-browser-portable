@@ -16,6 +16,13 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 function Log([string]$m) { Write-Host "detail: cdp-dump: $m" }
+function J($o) {
+  $s = $null
+  try { $s = $o | ConvertTo-Json -Compress -Depth 6 } catch { $s = "<json error: $($_.Exception.Message)>" }
+  if ($null -eq $s) { $s = '<null>' }
+  if ($s.Length -gt 700) { return $s.Substring(0, 700) }
+  return $s
+}
 
 $proc = $null
 $ws = $null
@@ -137,13 +144,26 @@ try {
       $connTask = $script:ws.ConnectAsync([Uri]$t.webSocketDebuggerUrl, $script:ct)
       if (-not $connTask.Wait(15000)) { throw "$tag ws connect timeout (15s)" }
       Log "$tag ws connected (attempt $attempt)"
-      try { $null = Invoke-Cdp 'Runtime.enable' @{}; return $true }
+      try {
+        $en = Invoke-Cdp 'Runtime.enable' @{}
+        if ($en.PSObject.Properties['error']) { Log "$tag Runtime.enable RPC error: $(J $en.error)" }
+        else { Log "$tag Runtime.enable ok" }
+        return $true
+      }
       catch { Log "$tag Runtime.enable attempt ${attempt}: $($_.Exception.Message)"; if ($attempt -lt 2) { Start-Sleep -Seconds 3 } }
     }
     return $false
   }
   if (-not (Connect-Session $target 'attach')) { throw 'Runtime.enable failed after 2 attempts' }
+  # diagnostic: does evaluate work AT ALL on this target before we navigate?
+  try {
+    $pr = Invoke-Cdp 'Runtime.evaluate' @{ expression = '1+1'; returnByValue = $true }
+    if ($pr.PSObject.Properties['error']) { Log "eval probe RPC error: $(J $pr.error)" }
+    else { Log "eval probe: $(J $pr.result)" }
+  } catch { Log "eval probe exception: $($_.Exception.Message)" }
 
+  $locDiagLogged = $false
+  $reDiagLogged = $false
   if ($navDriven) {
     $null = Invoke-Cdp 'Page.enable' @{}
     $nav = Invoke-Cdp 'Page.navigate' @{ url = $Url }
@@ -162,6 +182,7 @@ try {
         if ($null -ne $r.result -and $null -ne $r.result.result -and $null -ne $r.result.result.PSObject.Properties['value']) {
           $loc = [string]$r.result.result.value
         }
+        elseif (-not $locDiagLogged) { $locDiagLogged = $true; Log "loc poll no-value response: $(J $r)" }
         if (($loc -eq $Url) -or $loc.StartsWith($prefix)) { break }
       } catch { Log "loc poll: $($_.Exception.Message)" }
     }
@@ -182,23 +203,29 @@ try {
         } catch { Log "re-list: $($_.Exception.Message)" }
         if ($null -eq $fresh) { Start-Sleep -Milliseconds $PollMs }
       }
-      if ($null -eq $fresh) { throw "navigation to $Url did not commit (location.href=$loc; no re-listed target either)" }
-      Log "fresh attach: re-listed target url=$($fresh.url)"
-      if (-not (Connect-Session $fresh 'reattach')) { throw 'fresh attach: Runtime.enable failed after 2 attempts' }
-      $loc = ''
-      $rlim = [DateTime]::UtcNow.AddSeconds(10)
-      while ([DateTime]::UtcNow -lt $rlim) {
-        Start-Sleep -Milliseconds $PollMs
-        try {
-          $r = Invoke-Cdp 'Runtime.evaluate' @{ expression = 'location.href'; returnByValue = $true }
-          if ($null -ne $r.result -and $null -ne $r.result.result -and $null -ne $r.result.result.PSObject.Properties['value']) {
-            $loc = [string]$r.result.result.value
-          }
-          if (($loc -eq $Url) -or $loc.StartsWith($prefix)) { break }
-        } catch { Log "reattach loc poll: $($_.Exception.Message)" }
+      if ($null -eq $fresh) {
+        Log "navigation to $Url did not commit (location.href=$loc; no re-listed target); continuing to extraction"
+      } else {
+        Log "fresh attach: re-listed target url=$($fresh.url)"
+        if (-not (Connect-Session $fresh 'reattach')) { throw 'fresh attach: Runtime.enable failed after 2 attempts' }
+        $loc = ''
+        $rlim = [DateTime]::UtcNow.AddSeconds(10)
+        while ([DateTime]::UtcNow -lt $rlim) {
+          Start-Sleep -Milliseconds $PollMs
+          try {
+            $r = Invoke-Cdp 'Runtime.evaluate' @{ expression = 'location.href'; returnByValue = $true }
+            if ($null -ne $r.result -and $null -ne $r.result.result -and $null -ne $r.result.result.PSObject.Properties['value']) {
+              $loc = [string]$r.result.result.value
+            }
+            elseif (-not $reDiagLogged) { $reDiagLogged = $true; Log "reattach loc poll no-value response: $(J $r)" }
+            if (($loc -eq $Url) -or $loc.StartsWith($prefix)) { break }
+          } catch { Log "reattach loc poll: $($_.Exception.Message)" }
+        }
+        Log "reattach location.href=[$loc]"
+        if (($loc -ne $Url) -and (-not $loc.StartsWith($prefix))) {
+          Log "reattach: $Url still not committed (location.href=$loc); continuing to extraction"
+        }
       }
-      Log "reattach location.href=[$loc]"
-      if (($loc -ne $Url) -and (-not $loc.StartsWith($prefix))) { throw "reattach: $Url still not committed (location.href=$loc)" }
     }
   }
 
@@ -221,24 +248,44 @@ try {
   }
 
   $html = ''
+  $r = $null
   try {
     $r = Invoke-Cdp 'Runtime.evaluate' @{ expression = 'document.documentElement.outerHTML'; returnByValue = $true }
-    if ($null -ne $r.result -and $null -ne $r.result.result -and $null -ne $r.result.result.PSObject.Properties['value']) {
+    if ($r.PSObject.Properties['error']) { Log "outerHTML RPC error: $(J $r.error)" }
+    elseif ($null -ne $r.result -and $null -ne $r.result.result -and $null -ne $r.result.result.PSObject.Properties['value']) {
       $html = [string]$r.result.result.value
     }
+    else { Log "outerHTML no-value response: $(J $r)" }
   } catch { Log "outerHTML evaluate: $($_.Exception.Message)" }
   if (-not $html) {
     Log 'outerHTML evaluate empty; falling back to DOM.getOuterHTML'
     try {
-      $null = Invoke-Cdp 'DOM.enable' @{}
+      $en = Invoke-Cdp 'DOM.enable' @{}
+      if ($en.PSObject.Properties['error']) { Log "DOM.enable RPC error: $(J $en.error)" }
       $doc = Invoke-Cdp 'DOM.getDocument' @{ depth = -1 }
-      if ($null -ne $doc.result -and $null -ne $doc.result.root) {
+      if ($doc.PSObject.Properties['error']) { Log "DOM.getDocument RPC error: $(J $doc.error)" }
+      elseif ($null -ne $doc.result -and $null -ne $doc.result.root) {
         $outer = Invoke-Cdp 'DOM.getOuterHTML' @{ nodeId = $doc.result.root.nodeId }
-        if ($null -ne $outer.result -and $outer.result.PSObject.Properties['outerHTML']) { $html = [string]$outer.result.outerHTML }
+        if ($outer.PSObject.Properties['error']) { Log "DOM.getOuterHTML RPC error: $(J $outer.error)" }
+        elseif ($null -ne $outer.result -and $outer.result.PSObject.Properties['outerHTML']) { $html = [string]$outer.result.outerHTML }
       }
+      else { Log "DOM.getDocument no-root response: $(J $doc)" }
     } catch { Log "DOM.getOuterHTML: $($_.Exception.Message)" }
   }
-  if (-not $html) { throw 'no DOM: outerHTML evaluate and DOM.getOuterHTML both produced nothing' }
+  if (-not $html) {
+    # captureSnapshot runs in the browser and needs no JS execution context -
+    # works even where Runtime/DOM domains answer empty for WebUI targets
+    Log 'no JS/DOM extraction; falling back to Page.captureSnapshot (mhtml)'
+    try {
+      $pe = Invoke-Cdp 'Page.enable' @{}
+      if ($pe.PSObject.Properties['error']) { Log "Page.enable RPC error: $(J $pe.error)" }
+      $snap = Invoke-Cdp 'Page.captureSnapshot' @{ format = 'mhtml' }
+      if ($snap.PSObject.Properties['error']) { Log "captureSnapshot RPC error: $(J $snap.error)" }
+      elseif ($null -ne $snap.result -and $snap.result.PSObject.Properties['data']) { $html = [string]$snap.result.data }
+      else { Log "captureSnapshot no-data response: $(J $snap)" }
+    } catch { Log "captureSnapshot: $($_.Exception.Message)" }
+  }
+  if (-not $html) { throw 'no DOM: outerHTML, DOM.getOuterHTML and Page.captureSnapshot all produced nothing' }
   Set-Content -Path $OutFile -Value $html -Encoding utf8
   Log "dom bytes=$($html.Length)"
   $ok = $true
