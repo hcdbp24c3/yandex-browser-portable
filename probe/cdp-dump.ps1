@@ -197,6 +197,12 @@ try {
   if ($null -ne $proc) {
     try { if (-not $proc.HasExited) { $proc.Kill($true) } } catch { Log "kill: $($_.Exception.Message)" }
   }
-  Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+  if ($NoLaunch) {
+    # the caller owns the browser process: leave it alive so further probes
+    # (e.g. the next policy URL) can attach to the same headed instance
+    Log 'NoLaunch: leaving the caller-launched browser running'
+  } else {
+    Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+  }
   if (-not $ok) { Log 'cdp extraction did not produce a DOM' }
 }

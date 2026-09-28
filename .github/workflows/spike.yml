@@ -12,9 +12,21 @@ name: Spike
 # double-quoted strings, no '#' inside step names, no '${{' interpolation
 # inside run bodies, verdict/detail lines are also written with Write-Host so
 # they are scrapeable from the job log.
+#
+# workflow_dispatch input "mode":
+#   full (default) - the original four probes (P1..P4), emits exactly 4 verdict lines
+#   p3h            - operator decision A: re-run ONLY the P3 policy check with a
+#                    VISIBLE (non-headless) browser, emits exactly 1 verdict line
+#                    (P3h). P1 still runs as the support step that extracts
+#                    browser.exe; its verdict is logged as detail: in this mode.
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'full = probes P1-P4; p3h = headed P3 policy re-run only'
+        required: false
+        default: 'full'
 
 permissions:
   contents: read
@@ -28,6 +40,7 @@ jobs:
         shell: pwsh
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SPIKE_MODE: ${{ inputs.mode }}
 
     steps:
       - name: Checkout
@@ -189,12 +202,16 @@ jobs:
           } catch {
             $v = "FAIL - $($_.Exception.Message)"
           }
-          EmitVerdict 'P1' $v
+          if ($env:SPIKE_MODE -eq 'p3h') {
+            EmitDetail "P1 support extract (mode=p3h, verdict suppressed): $v"
+          } else {
+            EmitVerdict 'P1' $v
+          }
           exit 0
 
       - name: P0 runtime diagnostics
         id: p0
-        if: always()
+        if: always() && inputs.mode != 'p3h'
         run: |
           if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
           function EmitDetail([string]$m) {
@@ -311,7 +328,7 @@ jobs:
           exit 0
       - name: P3a baseline policy dump
         id: p3a
-        if: always()
+        if: always() && inputs.mode != 'p3h'
         run: |
           if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
           function EmitDetail([string]$m) {
@@ -388,7 +405,7 @@ jobs:
 
       - name: P2 Chrome plus compatibility
         id: p2
-        if: always()
+        if: always() && inputs.mode != 'p3h'
         run: |
           if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
           if (-not $env:SEVENZIP) { $env:SEVENZIP = '7z' }
@@ -513,7 +530,7 @@ jobs:
 
       - name: P2b ini relative data dir
         id: p2b
-        if: always()
+        if: always() && inputs.mode != 'p3h'
         run: |
           if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
           function EmitDetail([string]$m) {
@@ -561,7 +578,7 @@ jobs:
 
       - name: P3b policy honoring
         id: p3b
-        if: always()
+        if: always() && inputs.mode != 'p3h'
         run: |
           if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
           function EmitVerdict([string]$id, [string]$v) {
@@ -689,7 +706,7 @@ jobs:
 
       - name: P4 EME probe
         id: p4
-        if: always()
+        if: always() && inputs.mode != 'p3h'
         run: |
           if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
           function EmitVerdict([string]$id, [string]$v) {
@@ -772,6 +789,203 @@ jobs:
           EmitVerdict 'P4' $v
           exit 0
 
+      - name: P3h headed policy re-run
+        id: p3h
+        if: always() && inputs.mode == 'p3h'
+        run: |
+          if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
+          function EmitVerdict([string]$id, [string]$v) {
+            $line = "$id verdict: $v"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'verdicts.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          function EmitDetail([string]$m) {
+            $line = "detail: $m"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'details.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          # secondary evidence: any on-disk file the browser wrote that mentions the test key
+          $script:SkipDir = '\\(Cache|Code Cache|GPUCache|GrShaderCache|DawnCache|ShaderCache|Service Worker|Crashpad|blob_storage|IndexedDB|File System|Session Storage|Local Storage)\\'
+          function Find-PolicyCache([string[]]$roots) {
+            $hits = @()
+            $budget = 67108864
+            foreach ($root in $roots) {
+              if (-not $root -or -not (Test-Path $root)) { continue }
+              $files = @()
+              $files += @(Get-ChildItem -Path (Join-Path $root 'policies') -Recurse -File -ErrorAction SilentlyContinue)
+              $files += @(Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue | Where-Object { ($_.Length -le 2097152) -and ($_.FullName -notmatch $script:SkipDir) } | Select-Object -First 3000)
+              foreach ($f in $files) {
+                if ($budget -le 0) { break }
+                $txt = $null
+                try { $txt = Get-Content -Path $f.FullName -Raw -ErrorAction SilentlyContinue } catch { $txt = $null }
+                if ($txt -and $txt.Contains('YandexAliceMsgDisable')) {
+                  $idx = $txt.IndexOf('YandexAliceMsgDisable')
+                  $s = [Math]::Max(0, $idx - 150)
+                  $len = [Math]::Min(400, $txt.Length - $s)
+                  $snip = ($txt.Substring($s, $len) -replace '\s+', ' ')
+                  $hits += "$($f.FullName) :: $snip"
+                  if ($hits.Count -ge 5) { return $hits }
+                }
+                $budget -= $f.Length
+              }
+            }
+            return $hits
+          }
+          $regKey = 'HKLM\SOFTWARE\Policies\YandexBrowser'
+          $keyExisted = $false
+          $v = 'IGNORED - probe did not run'
+          $script:P3hDom = ''
+          $script:P3hUrl = ''
+          $script:P3hNote = ''
+          try {
+            $app = Join-Path $env:SPIKE 'pkg\Yandex'
+            $exe = Join-Path $app 'browser.exe'
+            if (-not (Test-Path $exe)) { throw 'browser.exe missing (P1 did not produce a tree)' }
+            $dllPath = Join-Path $app 'version.dll'
+            if (Test-Path $dllPath) {
+              Move-Item -Path $dllPath -Destination "$dllPath.aside" -Force -ErrorAction SilentlyContinue
+              EmitDetail 'P3h version.dll moved aside so the headed run tests stock browser.exe'
+            }
+            $prof = Join-Path $env:SPIKE 'profiles\p3h'
+            New-Item -ItemType Directory -Force -Path $prof | Out-Null
+            $port = 9488
+            $headedBase = @('--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', '--disable-gpu', '--enable-logging=stderr', '--v=1')
+            $cdpScript = Join-Path (Get-Location).Path 'probe/cdp-dump.ps1'
+
+            # launches a VISIBLE browser (no --headless anywhere) and extracts the
+            # policy page over CDP; falls back from browser://policy/ to chrome://policy/
+            # in the SAME instance, then leaves the DOM in $script:P3hDom
+            function Invoke-HeadedDump([string]$tag) {
+              $script:P3hDom = ''
+              $script:P3hUrl = ''
+              $script:P3hNote = ''
+              $hout = Join-Path $env:SPIKE "p3h-$tag-headed-out.txt"
+              $herr = Join-Path $env:SPIKE "p3h-$tag-headed-err.txt"
+              $argList = $headedBase + @("--user-data-dir=$prof", "--remote-debugging-port=$port", '--remote-allow-origins=*', 'about:blank')
+              $bp = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -WorkingDirectory (Split-Path -Parent $exe) -RedirectStandardOutput $hout -RedirectStandardError $herr
+              Start-Sleep -Seconds 15
+              $alive = (-not $bp.HasExited)
+              $wins = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { "pid=$($_.Id) title=[$($_.MainWindowTitle)]" })
+              EmitDetail "P3h $tag headed launch alive=$alive exit=$(if ($bp.HasExited) { $bp.ExitCode } else { 'running' }) windows=[$($wins -join ', ')]"
+              if (-not $alive) { $script:P3hNote = "headed browser exited early code=$($bp.ExitCode)"; return }
+              $dt = ''
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/json/version" -UseBasicParsing -TimeoutSec 8
+                $j = $r.Content | ConvertFrom-Json
+                $dt = [string]$j.Browser
+              } catch { $dt = "error: $($_.Exception.Message)" }
+              EmitDetail "P3h $tag devtools /json/version = $dt"
+              if (-not $dt -or $dt.StartsWith('error')) {
+                Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+                $script:P3hNote = "devtools endpoint not reachable ($dt)"
+                return
+              }
+              $candidates = @()
+              foreach ($t in @('browser://policy/', 'chrome://policy/')) {
+                $safe = ($t -replace '[^a-zA-Z]', '_')
+                $cdpOut = Join-Path $env:SPIKE "p3h-$tag-$safe.html"
+                $null = & $cdpScript -App $app -Url $t -OutFile $cdpOut -Base $headedBase -Profile $prof -Port $port -NoLaunch -DriveNav -ReadyMs 30000
+                $cdpExit = $LASTEXITCODE
+                $cdom = $null
+                if (Test-Path $cdpOut) { $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue }
+                $clen = 0
+                if ($null -ne $cdom) { $clen = $cdom.Length }
+                EmitDetail "P3h $tag cdp url=$t exit=$cdpExit dom bytes=$clen"
+                if (($null -ne $cdom) -and ($clen -gt 200)) { $candidates += @{ url = $t; dom = $cdom } }
+                elseif ($null -eq $script:P3hNote -or $script:P3hNote -eq '') { $script:P3hNote = "$t exit=$cdpExit bytes=$clen" }
+              }
+              try {
+                $lr = Invoke-WebRequest -Uri "http://127.0.0.1:$port/json/list" -UseBasicParsing -TimeoutSec 5
+                $pages = @($lr.Content | ConvertFrom-Json | Where-Object { $_.type -eq 'page' })
+                EmitDetail "P3h $tag page urls after attempts=[$(($pages | ForEach-Object { $_.url }) -join ', ')]"
+              } catch { EmitDetail "P3h $tag json/list: $($_.Exception.Message)" }
+              Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 2
+              $best = $null
+              foreach ($c in $candidates) { if ($c.dom -match 'YandexAliceMsgDisable') { $best = $c; break } }
+              if ($null -eq $best) { foreach ($c in $candidates) { if ($c.dom -notmatch 'chrome-error|ERR_INVALID|not reached') { $best = $c; break } } }
+              if (($null -eq $best) -and ($candidates.Count -gt 0)) { $best = ($candidates | Sort-Object { $_.dom.Length } | Select-Object -Last 1) }
+              if ($null -eq $best) {
+                if ($script:P3hNote -eq '') { $script:P3hNote = 'no policy page committed on either URL' }
+                return
+              }
+              $script:P3hDom = [string]$best.dom
+              $script:P3hUrl = [string]$best.url
+            }
+
+            $null = & reg.exe query $regKey
+            $keyExisted = ($LASTEXITCODE -eq 0)
+            EmitDetail "P3h policy key existed before the test: $keyExisted"
+
+            # baseline MUST be captured before any policy value is written
+            Invoke-HeadedDump 'baseline'
+            Set-Content -Path (Join-Path $env:SPIKE 'p3h-baseline.txt') -Value $script:P3hDom -Encoding utf8
+            $baseHas = $script:P3hDom -match 'YandexAliceMsgDisable'
+            EmitDetail "P3h baseline (before reg add) dom bytes=$($script:P3hDom.Length) url=$($script:P3hUrl) note=$($script:P3hNote); YandexAliceMsgDisable present=$baseHas (expected False)"
+            $baseCache = @(Find-PolicyCache @($prof))
+            EmitDetail "P3h baseline policy-cache hits=$($baseCache.Count)"
+            if ($baseHas) { EmitDetail 'P3h WARNING: test key already present in the headed baseline; P3h verdict may be unreliable' }
+
+            $null = & reg.exe add $regKey /v YandexAliceMsgDisable /t REG_DWORD /d 1 /f
+            if ($LASTEXITCODE -ne 0) { throw "reg add failed exit=$LASTEXITCODE" }
+            EmitDetail 'P3h reg add HKLM\SOFTWARE\Policies\YandexBrowser YandexAliceMsgDisable=1 (REG_DWORD)'
+
+            Invoke-HeadedDump 'policy'
+            $dom = $script:P3hDom
+            Set-Content -Path (Join-Path $env:SPIKE 'p3h-policy.txt') -Value $dom -Encoding utf8
+            $url = $script:P3hUrl
+            EmitDetail "P3h policy dump bytes=$($dom.Length) url=$url note=$($script:P3hNote)"
+            $herr = Join-Path $env:SPIKE 'p3h-policy-headed-err.txt'
+            $pl = @()
+            if (Test-Path $herr) { $pl = @(Get-Content $herr -ErrorAction SilentlyContinue | Where-Object { $_ -match 'policy|Policy|Alice' } | Select-Object -First 8) }
+            if ($pl.Count -gt 0) { EmitDetail "P3h policy stderr lines: $(($pl -join ' || '))" }
+            else { EmitDetail 'P3h no policy lines in the headed stderr' }
+
+            $idx = $dom.IndexOf('YandexAliceMsgDisable')
+            $ev = ''
+            if ($idx -ge 0) {
+              $s = [Math]::Max(0, $idx - 300)
+              $len = [Math]::Min(900, $dom.Length - $s)
+              $ev = ($dom.Substring($s, $len) -replace '\s+', ' ')
+              if ($ev.Length -gt 500) { $ev = $ev.Substring(0, 500) }
+              EmitDetail "P3h evidence: $ev"
+            }
+            $alm = @($dom -split '\r?\n' | Where-Object { $_ -match 'YandexAutoLaunchMode' } | ForEach-Object { $_.Trim() } | Select-Object -First 3)
+            if ($alm.Count -gt 0) { EmitDetail "P3h YandexAutoLaunchMode lines: $(($alm -join ' || ').Substring(0, [Math]::Min(400, ($alm -join ' || ').Length)))" }
+            $cacheHits = @(Find-PolicyCache @($prof, 'C:\ProgramData\Yandex', (Join-Path $env:LOCALAPPDATA 'Yandex')))
+            if ($cacheHits.Count -gt 0) { EmitDetail "P3h policy-cache hits=$($cacheHits.Count); first=$($cacheHits[0])" }
+            else { EmitDetail 'P3h policy-cache hits=0 (no on-disk file mentions the test key)' }
+            $looksError = $dom -match 'chrome-error|ERR_INVALID|ERR_FAILED|not reached'
+            $rendered = ($dom.Length -ge 200) -and (-not $looksError)
+            EmitDetail "P3h rendered=$rendered (error-like page=$looksError)"
+
+            if ($idx -ge 0) {
+              $v = "HONORED - headed $url lists YandexAliceMsgDisable with policy source (domBytes=$($dom.Length); evidence: $ev)"
+            } elseif ($cacheHits.Count -gt 0) {
+              $v = "HONORED - headed browser ingested the HKLM test key into its policy cache (domBytes=$($dom.Length); cache: $($cacheHits[0]))"
+            } elseif ($rendered) {
+              $v = "IGNORED - headed $url rendered (domBytes=$($dom.Length)) but YandexAliceMsgDisable is absent and no policy cache entry exists"
+            } else {
+              $v = "IGNORED - headed policy page never rendered (url=$url; domBytes=$($dom.Length); note=$($script:P3hNote)) and no policy cache entry exists"
+            }
+          } catch {
+            $v = "IGNORED - probe error: $($_.Exception.Message)"
+          } finally {
+            Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+            $null = & reg.exe delete $regKey /v YandexAliceMsgDisable /f
+            $valueGone = ($LASTEXITCODE -eq 0)
+            $removedKey = $false
+            if (-not $keyExisted) {
+              $null = & reg.exe delete $regKey /f
+              $removedKey = ($LASTEXITCODE -eq 0)
+            }
+            EmitDetail "P3h cleanup: test value removed=$valueGone; whole key removed=$removedKey"
+          }
+          EmitVerdict 'P3h' $v
+          exit 0
+
       - name: Findings summary
         id: summary
         if: always()
@@ -787,8 +1001,10 @@ jobs:
             if ($parts.Count -eq 2) { Write-Host "$($parts[0]) = $($parts[1])" }
             else { Write-Host $l }
           }
-          Write-Host "verdict line count = $($lines.Count) (expected 4)"
-          if ($lines.Count -ne 4) { Write-Host 'WARNING: verdict line count is not 4 - check probe steps above' }
+          $expected = 4
+          if ($env:SPIKE_MODE -eq 'p3h') { $expected = 1 }
+          Write-Host "mode=$($env:SPIKE_MODE) verdict line count = $($lines.Count) (expected $expected)"
+          if ($lines.Count -ne $expected) { Write-Host "WARNING: verdict line count is not $expected - check probe steps above" }
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Spike verdict lines ($($lines.Count))" -Encoding utf8
           $df = Join-Path $dir 'details.txt'
           if (Test-Path $df) {
