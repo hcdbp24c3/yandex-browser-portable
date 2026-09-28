@@ -79,14 +79,14 @@ jobs:
           $v = 'FAIL - probe did not run'
           try {
             $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json' }
-            $list = Invoke-RestMethod -Headers $h 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/y/Yandex/Browser'
+            $list = Invoke-RestMethod -Headers $h -Uri 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/y/Yandex/Browser' -TimeoutSec 30
             $names = @($list | ForEach-Object { $_.name })
             if ($names.Count -eq 0) { throw 'winget manifest listing is empty' }
             $latest = $names | Sort-Object { try { [version]$_ } catch { [version]'0.0.0.0' } } | Select-Object -Last 1
             EmitDetail "winget manifests: $($names.Count) entries; latest=$latest"
 
             $mfUrl = "https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/y/Yandex/Browser/$latest/Yandex.Browser.installer.yaml"
-            $mf = (Invoke-WebRequest -Uri $mfUrl -UseBasicParsing).Content
+            $mf = (Invoke-WebRequest -Uri $mfUrl -UseBasicParsing -TimeoutSec 30).Content
             $pkgVer = $latest
             if ($mf -match 'PackageVersion:\s*(\S+)') { $pkgVer = $Matches[1] }
             $urls = @([regex]::Matches($mf, '(?m)^\s*InstallerUrl:\s*(\S+)') | ForEach-Object { $_.Groups[1].Value })
@@ -278,15 +278,15 @@ jobs:
             }
 
             $chosen = '--headless=new --disable-gpu --no-first-run --no-default-browser-check --disable-crash-reporter --enable-logging=stderr --v=1'
-            $bHelium = Invoke-Trial 'helium-base' $heliumBase 45000
+            $bHelium = Invoke-Trial 'helium-base' $heliumBase 30000
             $bPlain = -1
-            if ($bHelium -le 200) { $bPlain = Invoke-Trial 'plain-base' $plainBase 45000 }
+            if ($bHelium -le 200) { $bPlain = Invoke-Trial 'plain-base' $plainBase 30000 }
             if (($bHelium -le 200) -and ($bPlain -gt 200)) {
               $chosen = '--headless --no-first-run --no-default-browser-check --disable-crash-reporter'
               EmitDetail 'P0 plain base produced dump output; DUMP_BASE switched to plain'
             } elseif (($bHelium -le 200) -and ($bPlain -le 200)) {
               $timeoutBase = @($heliumBase) + @('--timeout=15000')
-              $bTimeout = Invoke-Trial 'helium-timeout' $timeoutBase 45000
+              $bTimeout = Invoke-Trial 'helium-timeout' $timeoutBase 30000
               if ($bTimeout -gt 200) {
                 $chosen = '--headless=new --disable-gpu --no-first-run --no-default-browser-check --disable-crash-reporter --enable-logging=stderr --v=1 --timeout=15000'
                 EmitDetail 'P0 --timeout forced dump output; DUMP_BASE carries --timeout=15000'
@@ -338,10 +338,10 @@ jobs:
             $argList = $base + @("--user-data-dir=$prof", '--virtual-time-budget=15000', '--dump-dom', 'browser://policy/')
             $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -WorkingDirectory (Split-Path -Parent $exe) -RedirectStandardOutput $out -RedirectStandardError $err
             $ec = 'running'
-            if (-not $p.WaitForExit(90000)) {
+            if (-not $p.WaitForExit(45000)) {
               try { $p.Kill($true) } catch { EmitDetail "P3a kill: $($_.Exception.Message)" }
-              $null = $p.WaitForExit(5000); $ec = 'killed@90s'
-              EmitDetail 'P3a dump exceeded 90s and was killed'
+              $null = $p.WaitForExit(5000); $ec = 'killed@45s'
+              EmitDetail 'P3a dump exceeded 45s and was killed'
             } else { $ec = $p.ExitCode }
             Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
             $dom = ''
@@ -396,7 +396,7 @@ jobs:
             $exe = Join-Path $app 'browser.exe'
             if (-not (Test-Path $exe)) { throw 'browser.exe missing (P1 did not produce a tree)' }
             $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json' }
-            $rel = Invoke-RestMethod -Headers $h 'https://api.github.com/repos/bibicadotnet/Chromium_SetDLL/releases/latest'
+            $rel = Invoke-RestMethod -Headers $h -Uri 'https://api.github.com/repos/bibicadotnet/Chromium_SetDLL/releases/latest' -TimeoutSec 30
             $asset = $rel.assets | Where-Object { $_.name -match 'Chrome.*\.7z$' } | Select-Object -First 1
             if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -match '\.7z$|\.zip$' } | Select-Object -First 1 }
             if (-not $asset) { throw 'no Chrome++ asset on the pinned latest release' }
@@ -589,10 +589,10 @@ jobs:
             $argList = $base + @("--user-data-dir=$prof", '--virtual-time-budget=15000', '--dump-dom', 'browser://policy/')
             $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -WorkingDirectory (Split-Path -Parent $exe) -RedirectStandardOutput $out -RedirectStandardError $err
             $ec = 'running'
-            if (-not $p.WaitForExit(90000)) {
+            if (-not $p.WaitForExit(45000)) {
               try { $p.Kill($true) } catch { EmitDetail "P3b kill: $($_.Exception.Message)" }
-              $null = $p.WaitForExit(5000); $ec = 'killed@90s'
-              EmitDetail 'P3b dump exceeded 90s and was killed'
+              $null = $p.WaitForExit(5000); $ec = 'killed@45s'
+              EmitDetail 'P3b dump exceeded 45s and was killed'
             } else { $ec = $p.ExitCode }
             Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
             $dom = ''
@@ -627,7 +627,7 @@ jobs:
             else { EmitDetail 'P3b YandexAutoLaunchMode absent from the dump (browser://policy only lists registered keys)' }
             try {
               $admxUrl = 'https://download.cdn.yandex.net/browser/corporate/YandexBrowser.admx'
-              $admx = (Invoke-WebRequest -Uri $admxUrl -UseBasicParsing).Content
+              $admx = (Invoke-WebRequest -Uri $admxUrl -UseBasicParsing -TimeoutSec 30).Content
               $idx = $admx.IndexOf('YandexAutoLaunchMode')
               if ($idx -ge 0) {
                 $chunk = ($admx.Substring($idx, [Math]::Min(900, $admx.Length - $idx)) -replace '\s+', ' ')
@@ -706,10 +706,10 @@ jobs:
             $argList = $base + @("--user-data-dir=$prof", '--virtual-time-budget=30000', '--dump-dom', $uri)
             $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -WorkingDirectory (Split-Path -Parent $exe) -RedirectStandardOutput $out -RedirectStandardError $err
             $ec = 'running'
-            if (-not $p.WaitForExit(120000)) {
+            if (-not $p.WaitForExit(60000)) {
               try { $p.Kill($true) } catch { EmitDetail "P4 kill: $($_.Exception.Message)" }
-              $null = $p.WaitForExit(5000); $ec = 'killed@120s'
-              EmitDetail 'P4 exceeded 120s and was killed'
+              $null = $p.WaitForExit(5000); $ec = 'killed@60s'
+              EmitDetail 'P4 exceeded 60s and was killed'
             } else { $ec = $p.ExitCode }
             Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
             $dom = ''

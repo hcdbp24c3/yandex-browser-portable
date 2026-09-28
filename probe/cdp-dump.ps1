@@ -59,7 +59,8 @@ try {
   $ws = New-Object System.Net.WebSockets.ClientWebSocket
   $ws.Options.KeepAliveInterval = [TimeSpan]::FromSeconds(5)
   $ct = [Threading.CancellationToken]::None
-  $ws.ConnectAsync([Uri]$target.webSocketDebuggerUrl, $ct).GetAwaiter().GetResult()
+  $connTask = $ws.ConnectAsync([Uri]$target.webSocketDebuggerUrl, $ct)
+  if (-not $connTask.Wait(15000)) { throw 'ws connect timeout (15s)' }
   Log 'ws connected'
 
 
@@ -73,7 +74,9 @@ try {
     $buf = New-Object byte[] 262144
     do {
       $seg = [ArraySegment[byte]]::new($buf)
-      $res = $ws.ReceiveAsync($seg, $ct).GetAwaiter().GetResult()
+      $recvTask = $ws.ReceiveAsync($seg, $ct)
+      if (-not $recvTask.Wait(10000)) { throw 'ws receive timeout (10s)' }
+      $res = $recvTask.Result
       if ($res.MessageType -eq [Net.WebSockets.WebSocketMessageType]::Close) { throw 'ws closed by peer' }
       $ms.Write($buf, 0, $res.Count)
     } while (-not $res.EndOfMessage)
