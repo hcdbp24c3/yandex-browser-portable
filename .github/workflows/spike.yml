@@ -192,6 +192,108 @@ jobs:
           EmitVerdict 'P1' $v
           exit 0
 
+      - name: P0 runtime diagnostics
+        id: p0
+        if: always()
+        run: |
+          if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
+          function EmitDetail([string]$m) {
+            $line = "detail: $m"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'details.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          try {
+            $app = Join-Path $env:SPIKE 'pkg\Yandex'
+            $exe = Join-Path $app 'browser.exe'
+            if (-not (Test-Path $exe)) { throw 'browser.exe missing (P1 did not produce a tree)' }
+            $dir = Split-Path -Parent $exe
+            EmitDetail "P0 payload: browser.dll next to exe=$(Test-Path (Join-Path $app 'browser.dll')); in version dir=$(Test-Path (Join-Path $app '26.8.4.893\browser.dll'))"
+
+            # health probe: does the exe honour --version (prints and exits)?
+            $vo = Join-Path $env:SPIKE 'p0-version-out.txt'
+            $ve = Join-Path $env:SPIKE 'p0-version-err.txt'
+            $vp = Start-Process -FilePath $exe -ArgumentList @('--version') -PassThru -NoNewWindow -WorkingDirectory $dir -RedirectStandardOutput $vo -RedirectStandardError $ve
+            $vExit = 'running'
+            if (-not $vp.WaitForExit(15000)) {
+              try { $vp.Kill($true) } catch { EmitDetail "P0 --version kill: $($_.Exception.Message)" }
+              $null = $vp.WaitForExit(3000); $vExit = 'killed@15s'
+            } else { $vExit = $vp.ExitCode }
+            Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+            $vOut = ''
+            if (Test-Path $vo) { $vOut = ((Get-Content $vo -Raw -ErrorAction SilentlyContinue) -replace '\s+', ' ').Trim() }
+            if ($vOut.Length -gt 300) { $vOut = $vOut.Substring(0, 300) }
+            EmitDetail "P0 --version exit=$vExit out=[$vOut]"
+
+            function Invoke-Trial([string]$tag, [string[]]$base) {
+              $o = Join-Path $env:SPIKE "p0-$tag-out.txt"
+              $e2 = Join-Path $env:SPIKE "p0-$tag-err.txt"
+              $prof = Join-Path $env:SPIKE "profiles\p0-$tag"
+              $argList = $base + @("--user-data-dir=$prof", '--dump-dom', 'about:blank')
+              $pr = $null
+              try {
+                $pr = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -WorkingDirectory $dir -RedirectStandardOutput $o -RedirectStandardError $e2
+              } catch {
+                EmitDetail "P0 $tag start failed: $($_.Exception.Message)"
+                return -1
+              }
+              Start-Sleep -Seconds 6
+              $procs = @(Get-CimInstance Win32_Process -Filter "Name='browser.exe' OR Name='browser_proxy.exe'" -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name):pid=$($_.ProcessId):pp=$($_.ParentProcessId)" })
+              EmitDetail "P0 $tag process tree at t+6s: $($procs -join ', ')"
+              $mw = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { "pid=$($_.Id):window=[$($_.MainWindowTitle)]" })
+              if ($mw.Count -gt 0) { EmitDetail "P0 $tag window titles: $($mw -join ', ')" }
+              $ec = 'running'
+              if (-not $pr.WaitForExit(54000)) {
+                try { $pr.Kill($true) } catch { EmitDetail "P0 $tag kill: $($_.Exception.Message)" }
+                $null = $pr.WaitForExit(5000); $ec = 'killed@60s'
+              } else { $ec = $pr.ExitCode }
+              Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 1
+              $len = -1
+              if (Test-Path $o) { $len = (Get-Item $o).Length }
+              $eh = ''
+              if (Test-Path $e2) { $eh = (@(Get-Content $e2 -TotalCount 12 -ErrorAction SilentlyContinue) -join ' | ') -replace '\s+', ' ' }
+              if ($eh.Length -gt 700) { $eh = $eh.Substring(0, 700) }
+              EmitDetail "P0 $tag exit=$ec outBytes=$len"
+              EmitDetail "P0 $tag stderr head=[$eh]"
+              return $len
+            }
+
+            $heliumBase = @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', '--enable-logging=stderr', '--v=1')
+            $plainBase = @('--headless', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter')
+            $bHelium = Invoke-Trial 'helium-base' $heliumBase
+            $bPlain = Invoke-Trial 'plain-base' $plainBase
+            $chosen = '--headless=new --disable-gpu --no-first-run --no-default-browser-check --disable-crash-reporter --enable-logging=stderr --v=1'
+            if (($bHelium -le 200) -and ($bPlain -gt 200)) { $chosen = '--headless --no-first-run --no-default-browser-check --disable-crash-reporter' }
+            Add-Content -Path $env:GITHUB_ENV -Value "DUMP_BASE=$chosen" -Encoding utf8
+            EmitDetail "P0 chosen DUMP_BASE=$chosen (heliumBytes=$bHelium plainBytes=$bPlain)"
+
+            if (($bHelium -le 200) -and ($bPlain -le 200)) {
+              $prof = Join-Path $env:SPIKE 'profiles\p0-cdp'
+              $argList = $heliumBase + @("--user-data-dir=$prof", '--remote-debugging-port=9444', 'about:blank')
+              $pr = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -WorkingDirectory $dir -RedirectStandardOutput (Join-Path $env:SPIKE 'p0-cdp-out.txt') -RedirectStandardError (Join-Path $env:SPIKE 'p0-cdp-err.txt')
+              $cdp = 'no-response'
+              foreach ($i in 1..12) {
+                Start-Sleep -Seconds 2
+                try {
+                  $r = Invoke-WebRequest -Uri 'http://127.0.0.1:9444/json/version' -UseBasicParsing -TimeoutSec 3
+                  $body = ($r.Content -replace '\s+', ' ')
+                  $cut = [Math]::Min(300, $body.Length)
+                  $cdp = "HTTP $($r.StatusCode) " + $body.Substring(0, $cut)
+                  break
+                } catch {
+                  $cdp = "attempt${i}: $($_.Exception.Message)"
+                }
+              }
+              EmitDetail "P0 cdp probe (only runs when both dump bases were empty): $cdp"
+              try { $pr.Kill($true) } catch { EmitDetail "P0 cdp kill: $($_.Exception.Message)" }
+              Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+            }
+          } catch {
+            EmitDetail "P0 error: $($_.Exception.Message)"
+          }
+          exit 0
+
       - name: P3a baseline policy dump
         id: p3a
         if: always()
@@ -216,17 +318,28 @@ jobs:
             $out = Join-Path $env:SPIKE 'p3a-policy-out.txt'
             $err = Join-Path $env:SPIKE 'p3a-policy-err.txt'
             $prof = Join-Path $env:SPIKE 'profiles\p3a'
-            $argList = @('--headless', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', "--user-data-dir=$prof", '--virtual-time-budget=15000', '--dump-dom', 'browser://policy/')
-            $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
-            if (-not $p.WaitForExit(90000)) { $p.Kill($true); $p.WaitForExit(5000); EmitDetail 'P3a dump exceeded 90s and was killed' }
-            Stop-Process -Name browser -Force -ErrorAction SilentlyContinue
+            $base = @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', '--enable-logging=stderr', '--v=1')
+            if ($env:DUMP_BASE) { $base = @($env:DUMP_BASE -split ' ' | Where-Object { $_ }) }
+            $argList = $base + @("--user-data-dir=$prof", '--virtual-time-budget=15000', '--dump-dom', 'browser://policy/')
+            $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -WorkingDirectory (Split-Path -Parent $exe) -RedirectStandardOutput $out -RedirectStandardError $err
+            $ec = 'running'
+            if (-not $p.WaitForExit(90000)) {
+              try { $p.Kill($true) } catch { EmitDetail "P3a kill: $($_.Exception.Message)" }
+              $null = $p.WaitForExit(5000); $ec = 'killed@90s'
+              EmitDetail 'P3a dump exceeded 90s and was killed'
+            } else { $ec = $p.ExitCode }
+            Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
             $dom = ''
             if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
             if ($null -eq $dom) { $dom = '' }
             Set-Content -Path (Join-Path $env:SPIKE 'p3a-baseline.txt') -Value $dom -Encoding utf8
             $hasKey = $dom -match 'YandexAliceMsgDisable'
             $pageOk = ($dom -match 'browser://policy') -or ($dom.Length -gt 500)
-            EmitDetail "P3a baseline dom bytes=$($dom.Length); rendered=$pageOk; YandexAliceMsgDisable present=$hasKey (expected False before reg add)"
+            EmitDetail "P3a baseline dom bytes=$($dom.Length); exit=$ec; rendered=$pageOk; YandexAliceMsgDisable present=$hasKey (expected False before reg add)"
+            $eh = ''
+            if (Test-Path $err) { $eh = (@(Get-Content $err -TotalCount 12 -ErrorAction SilentlyContinue) -join ' | ') -replace '\s+', ' ' }
+            if ($eh.Length -gt 700) { $eh = $eh.Substring(0, 700) }
+            EmitDetail "P3a stderr head=[$eh]"
             if ($hasKey) { EmitDetail 'P3a WARNING: test key already present in the baseline dump; P3b verdict may be unreliable' }
             if (-not $pageOk) { EmitDetail 'P3a WARNING: baseline dump looks empty; browser://policy may not render headless' }
           } catch {
@@ -281,12 +394,22 @@ jobs:
               $o = Join-Path $env:SPIKE "p2-$tag-out.txt"
               $e2 = Join-Path $env:SPIKE "p2-$tag-err.txt"
               $prof = Join-Path $env:SPIKE "profiles\$tag"
-              $argList = @('--headless', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', "--user-data-dir=$prof", '--dump-dom', 'about:blank')
-              $pr = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -RedirectStandardOutput $o -RedirectStandardError $e2
-              if (-not $pr.WaitForExit(60000)) { $pr.Kill($true); $pr.WaitForExit(5000) }
-              Stop-Process -Name browser -Force -ErrorAction SilentlyContinue
-              $len = 0
+              $base = @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', '--enable-logging=stderr', '--v=1')
+              if ($env:DUMP_BASE) { $base = @($env:DUMP_BASE -split ' ' | Where-Object { $_ }) }
+              $argList = $base + @("--user-data-dir=$prof", '--dump-dom', 'about:blank')
+              $pr = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -WorkingDirectory (Split-Path -Parent $exe) -RedirectStandardOutput $o -RedirectStandardError $e2
+              $ec = 'running'
+              if (-not $pr.WaitForExit(54000)) {
+                try { $pr.Kill($true) } catch { EmitDetail "P2 $tag kill: $($_.Exception.Message)" }
+                $null = $pr.WaitForExit(5000); $ec = 'killed@60s'
+              } else { $ec = $pr.ExitCode }
+              Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+              $len = -1
               if (Test-Path $o) { $len = (Get-Item $o).Length }
+              $eh = ''
+              if (Test-Path $e2) { $eh = (@(Get-Content $e2 -TotalCount 10 -ErrorAction SilentlyContinue) -join ' | ') -replace '\s+', ' ' }
+              if ($eh.Length -gt 500) { $eh = $eh.Substring(0, 500) }
+              EmitDetail "P2 $tag exit=$ec outBytes=$len stderr=[$eh]"
               return $len
             }
 
@@ -436,10 +559,17 @@ jobs:
             $out = Join-Path $env:SPIKE 'p3b-policy-out.txt'
             $err = Join-Path $env:SPIKE 'p3b-policy-err.txt'
             $prof = Join-Path $env:SPIKE 'profiles\p3b'
-            $argList = @('--headless', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', "--user-data-dir=$prof", '--virtual-time-budget=15000', '--dump-dom', 'browser://policy/')
-            $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
-            if (-not $p.WaitForExit(90000)) { $p.Kill($true); $p.WaitForExit(5000); EmitDetail 'P3b dump exceeded 90s and was killed' }
-            Stop-Process -Name browser -Force -ErrorAction SilentlyContinue
+            $base = @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', '--enable-logging=stderr', '--v=1')
+            if ($env:DUMP_BASE) { $base = @($env:DUMP_BASE -split ' ' | Where-Object { $_ }) }
+            $argList = $base + @("--user-data-dir=$prof", '--virtual-time-budget=15000', '--dump-dom', 'browser://policy/')
+            $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -WorkingDirectory (Split-Path -Parent $exe) -RedirectStandardOutput $out -RedirectStandardError $err
+            $ec = 'running'
+            if (-not $p.WaitForExit(90000)) {
+              try { $p.Kill($true) } catch { EmitDetail "P3b kill: $($_.Exception.Message)" }
+              $null = $p.WaitForExit(5000); $ec = 'killed@90s'
+              EmitDetail 'P3b dump exceeded 90s and was killed'
+            } else { $ec = $p.ExitCode }
+            Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
             $dom = ''
             if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
             if ($null -eq $dom) { $dom = '' }
@@ -449,7 +579,11 @@ jobs:
             $keyLines = @($dom -split "\r?\n" | Where-Object { $_ -match 'YandexAliceMsgDisable' } | ForEach-Object { $_.Trim() } | Select-Object -First 3)
             $evidence = ($keyLines -join ' || ')
             if ($evidence.Length -gt 400) { $evidence = $evidence.Substring(0, 400) }
-            EmitDetail "P3b policy dump bytes=$($dom.Length); matching lines=$($keyLines.Count)"
+            EmitDetail "P3b policy dump bytes=$($dom.Length); exit=$ec; matching lines=$($keyLines.Count)"
+            $eh = ''
+            if (Test-Path $err) { $eh = (@(Get-Content $err -TotalCount 12 -ErrorAction SilentlyContinue) -join ' | ') -replace '\s+', ' ' }
+            if ($eh.Length -gt 700) { $eh = $eh.Substring(0, 700) }
+            EmitDetail "P3b stderr head=[$eh]"
             if ($honored) { EmitDetail "P3b evidence: $evidence" }
             else { EmitDetail 'P3b key not present in the browser://policy dump' }
 
@@ -532,10 +666,17 @@ jobs:
             $out = Join-Path $env:SPIKE 'p4-out.txt'
             $err = Join-Path $env:SPIKE 'p4-err.txt'
             $prof = Join-Path $env:SPIKE 'profiles\p4'
-            $argList = @('--headless', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', "--user-data-dir=$prof", '--virtual-time-budget=30000', '--dump-dom', $uri)
-            $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
-            if (-not $p.WaitForExit(120000)) { $p.Kill($true); $p.WaitForExit(5000); EmitDetail 'P4 exceeded 120s and was killed' }
-            Stop-Process -Name browser -Force -ErrorAction SilentlyContinue
+            $base = @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', '--enable-logging=stderr', '--v=1')
+            if ($env:DUMP_BASE) { $base = @($env:DUMP_BASE -split ' ' | Where-Object { $_ }) }
+            $argList = $base + @("--user-data-dir=$prof", '--virtual-time-budget=30000', '--dump-dom', $uri)
+            $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -WorkingDirectory (Split-Path -Parent $exe) -RedirectStandardOutput $out -RedirectStandardError $err
+            $ec = 'running'
+            if (-not $p.WaitForExit(120000)) {
+              try { $p.Kill($true) } catch { EmitDetail "P4 kill: $($_.Exception.Message)" }
+              $null = $p.WaitForExit(5000); $ec = 'killed@120s'
+              EmitDetail 'P4 exceeded 120s and was killed'
+            } else { $ec = $p.ExitCode }
+            Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
             $dom = ''
             if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
             if ($null -eq $dom) { $dom = '' }
@@ -549,7 +690,7 @@ jobs:
             if (Test-Path $err) { $wv = @(Get-Content $err -ErrorAction SilentlyContinue | Where-Object { $_ -match 'widevine|CDM' } | Select-Object -First 6) }
             if ($wv.Count -gt 0) { EmitDetail "P4 CDM stderr lines: $(($wv -join ' || '))" }
             else { EmitDetail 'P4 no widevine/CDM lines in stderr' }
-            EmitDetail "P4 dom bytes=$($dom.Length); parsed result=$eme"
+            EmitDetail "P4 dom bytes=$($dom.Length); exit=$ec; parsed result=$eme"
             if ($eme -eq 'CDM_OK') { $v = "PASS - CDM_OK from requestMediaKeySystemAccess (domBytes=$($dom.Length))" }
             else { $v = "FAIL - eme=$eme (domBytes=$($dom.Length))" }
           } catch {
