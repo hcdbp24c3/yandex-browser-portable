@@ -125,24 +125,33 @@ try {
   }
   $script:cdpSeq = 0
 
-  $enabled = $false
-  for ($attempt = 1; ($attempt -le 2) -and (-not $enabled); $attempt++) {
-    if ($null -ne $ws) { try { $ws.Dispose() } catch { Log "ws dispose: $($_.Exception.Message)" }; $ws = $null }
-    $ws = New-Object System.Net.WebSockets.ClientWebSocket
-    $ws.Options.KeepAliveInterval = [TimeSpan]::FromSeconds(5)
-    $ct = [Threading.CancellationToken]::None
-    $connTask = $ws.ConnectAsync([Uri]$target.webSocketDebuggerUrl, $ct)
-    if (-not $connTask.Wait(15000)) { throw 'ws connect timeout (15s)' }
-    Log "ws connected (attempt $attempt)"
-    try { $null = Invoke-Cdp 'Runtime.enable' @{}; $enabled = $true }
-    catch { Log "Runtime.enable attempt ${attempt}: $($_.Exception.Message)"; if ($attempt -lt 2) { Start-Sleep -Seconds 3 } }
+  # Connects (and re-connects) a CDP session. A cross-process navigation swap can
+  # leave the previous websocket pointing at the dead renderer, so callers pass a
+  # freshly re-listed target to open a NEW session that reaches the live renderer.
+  function Connect-Session($t, [string]$tag) {
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+      if ($null -ne $script:ws) { try { $script:ws.Dispose() } catch { Log "ws dispose: $($_.Exception.Message)" }; $script:ws = $null }
+      $script:ws = New-Object System.Net.WebSockets.ClientWebSocket
+      $script:ws.Options.KeepAliveInterval = [TimeSpan]::FromSeconds(5)
+      $script:ct = [Threading.CancellationToken]::None
+      $connTask = $script:ws.ConnectAsync([Uri]$t.webSocketDebuggerUrl, $script:ct)
+      if (-not $connTask.Wait(15000)) { throw "$tag ws connect timeout (15s)" }
+      Log "$tag ws connected (attempt $attempt)"
+      try { $null = Invoke-Cdp 'Runtime.enable' @{}; return $true }
+      catch { Log "$tag Runtime.enable attempt ${attempt}: $($_.Exception.Message)"; if ($attempt -lt 2) { Start-Sleep -Seconds 3 } }
+    }
+    return $false
   }
-  if (-not $enabled) { throw 'Runtime.enable failed after 2 attempts' }
+  if (-not (Connect-Session $target 'attach')) { throw 'Runtime.enable failed after 2 attempts' }
 
   if ($navDriven) {
     $null = Invoke-Cdp 'Page.enable' @{}
-    $null = Invoke-Cdp 'Page.navigate' @{ url = $Url }
-    Log "Page.navigate issued for $Url"
+    $nav = Invoke-Cdp 'Page.navigate' @{ url = $Url }
+    $navErr = ''
+    if ($nav.PSObject.Properties['error']) { $navErr = "rpc: $($nav.error.message)" }
+    elseif ($null -ne $nav.result -and $nav.result.PSObject.Properties['errorText']) { $navErr = [string]$nav.result.errorText }
+    if ($navErr) { Log "Page.navigate $Url errorText=$navErr" }
+    else { Log "Page.navigate issued for $Url (no errorText)" }
     $loc = ''
     $prefix = $Url.TrimEnd('/')
     $locLimit = [DateTime]::UtcNow.AddSeconds(15)
@@ -157,7 +166,40 @@ try {
       } catch { Log "loc poll: $($_.Exception.Message)" }
     }
     Log "navigated location.href=[$loc]"
-    if (($loc -ne $Url) -and (-not $loc.StartsWith($prefix))) { throw "navigation to $Url did not commit (location.href=$loc)" }
+    if (($loc -ne $Url) -and (-not $loc.StartsWith($prefix))) {
+      # The swap to the WebUI renderer can kill this session: /json/list may already
+      # show the committed url even though this session can no longer evaluate.
+      # Re-list the target, open a FRESH session and re-verify there.
+      Log "session lost the commit (location.href=$loc); re-listing targets for a fresh attach"
+      $fresh = $null
+      $fdl = [DateTime]::UtcNow.AddSeconds(10)
+      while (($null -eq $fresh) -and ([DateTime]::UtcNow -lt $fdl)) {
+        try {
+          $lr = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/json/list" -UseBasicParsing -TimeoutSec 3
+          foreach ($p in @($lr.Content | ConvertFrom-Json | Where-Object { $_.type -eq 'page' -and $_.url })) {
+            if ($p.url -like ($prefix + '*')) { $fresh = $p; break }
+          }
+        } catch { Log "re-list: $($_.Exception.Message)" }
+        if ($null -eq $fresh) { Start-Sleep -Milliseconds $PollMs }
+      }
+      if ($null -eq $fresh) { throw "navigation to $Url did not commit (location.href=$loc; no re-listed target either)" }
+      Log "fresh attach: re-listed target url=$($fresh.url)"
+      if (-not (Connect-Session $fresh 'reattach')) { throw 'fresh attach: Runtime.enable failed after 2 attempts' }
+      $loc = ''
+      $rlim = [DateTime]::UtcNow.AddSeconds(10)
+      while ([DateTime]::UtcNow -lt $rlim) {
+        Start-Sleep -Milliseconds $PollMs
+        try {
+          $r = Invoke-Cdp 'Runtime.evaluate' @{ expression = 'location.href'; returnByValue = $true }
+          if ($null -ne $r.result -and $null -ne $r.result.result -and $null -ne $r.result.result.PSObject.Properties['value']) {
+            $loc = [string]$r.result.result.value
+          }
+          if (($loc -eq $Url) -or $loc.StartsWith($prefix)) { break }
+        } catch { Log "reattach loc poll: $($_.Exception.Message)" }
+      }
+      Log "reattach location.href=[$loc]"
+      if (($loc -ne $Url) -and (-not $loc.StartsWith($prefix))) { throw "reattach: $Url still not committed (location.href=$loc)" }
+    }
   }
 
   try { $null = Invoke-Cdp 'Runtime.enable' @{} } catch { Log "Runtime.enable: $($_.Exception.Message)" }
@@ -178,11 +220,25 @@ try {
     Log "await value=[$val]"
   }
 
-  $r = Invoke-Cdp 'Runtime.evaluate' @{ expression = 'document.documentElement.outerHTML'; returnByValue = $true }
   $html = ''
-  if ($null -ne $r.result -and $null -ne $r.result.result -and $null -ne $r.result.result.PSObject.Properties['value']) {
-    $html = [string]$r.result.result.value
+  try {
+    $r = Invoke-Cdp 'Runtime.evaluate' @{ expression = 'document.documentElement.outerHTML'; returnByValue = $true }
+    if ($null -ne $r.result -and $null -ne $r.result.result -and $null -ne $r.result.result.PSObject.Properties['value']) {
+      $html = [string]$r.result.result.value
+    }
+  } catch { Log "outerHTML evaluate: $($_.Exception.Message)" }
+  if (-not $html) {
+    Log 'outerHTML evaluate empty; falling back to DOM.getOuterHTML'
+    try {
+      $null = Invoke-Cdp 'DOM.enable' @{}
+      $doc = Invoke-Cdp 'DOM.getDocument' @{ depth = -1 }
+      if ($null -ne $doc.result -and $null -ne $doc.result.root) {
+        $outer = Invoke-Cdp 'DOM.getOuterHTML' @{ nodeId = $doc.result.root.nodeId }
+        if ($null -ne $outer.result -and $outer.result.PSObject.Properties['outerHTML']) { $html = [string]$outer.result.outerHTML }
+      }
+    } catch { Log "DOM.getOuterHTML: $($_.Exception.Message)" }
   }
+  if (-not $html) { throw 'no DOM: outerHTML evaluate and DOM.getOuterHTML both produced nothing' }
   Set-Content -Path $OutFile -Value $html -Encoding utf8
   Log "dom bytes=$($html.Length)"
   $ok = $true

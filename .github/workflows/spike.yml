@@ -855,60 +855,105 @@ jobs:
             $cdpScript = Join-Path (Get-Location).Path 'probe/cdp-dump.ps1'
 
             # launches a VISIBLE browser (no --headless anywhere) and extracts the
-            # policy page over CDP; falls back from browser://policy/ to chrome://policy/
-            # in the SAME instance, then leaves the DOM in $script:P3hDom
+            # policy page over CDP. Stage 1 drives navigation (cdp-dump self-heals a
+            # renderer swap with a fresh attach); stage 2 re-attaches fresh to the
+            # committed target; stage 3 restarts headed with chrome://policy/ as the
+            # startup URL so the commit happens before we attach. DOM -> $script:P3hDom
             function Invoke-HeadedDump([string]$tag) {
               $script:P3hDom = ''
               $script:P3hUrl = ''
               $script:P3hNote = ''
-              $hout = Join-Path $env:SPIKE "p3h-$tag-headed-out.txt"
-              $herr = Join-Path $env:SPIKE "p3h-$tag-headed-err.txt"
-              $argList = $headedBase + @("--user-data-dir=$prof", "--remote-debugging-port=$port", '--remote-allow-origins=*', 'about:blank')
-              $bp = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -WorkingDirectory (Split-Path -Parent $exe) -RedirectStandardOutput $hout -RedirectStandardError $herr
-              Start-Sleep -Seconds 15
-              $alive = (-not $bp.HasExited)
-              $wins = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { "pid=$($_.Id) title=[$($_.MainWindowTitle)]" })
-              EmitDetail "P3h $tag headed launch alive=$alive exit=$(if ($bp.HasExited) { $bp.ExitCode } else { 'running' }) windows=[$($wins -join ', ')]"
-              if (-not $alive) { $script:P3hNote = "headed browser exited early code=$($bp.ExitCode)"; return }
-              $dt = ''
-              try {
-                $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/json/version" -UseBasicParsing -TimeoutSec 8
-                $j = $r.Content | ConvertFrom-Json
-                $dt = [string]$j.Browser
-              } catch { $dt = "error: $($_.Exception.Message)" }
-              EmitDetail "P3h $tag devtools /json/version = $dt"
-              if (-not $dt -or $dt.StartsWith('error')) {
-                Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
-                $script:P3hNote = "devtools endpoint not reachable ($dt)"
-                return
+              function Launch-Headed([string]$launchUrl, [string]$suffix) {
+                $hout = Join-Path $env:SPIKE "p3h-$tag-headed$suffix-out.txt"
+                $herrL = Join-Path $env:SPIKE "p3h-$tag-headed$suffix-err.txt"
+                $argList = $headedBase + @("--user-data-dir=$prof", "--remote-debugging-port=$port", '--remote-allow-origins=*', $launchUrl)
+                $bp = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -WorkingDirectory (Split-Path -Parent $exe) -RedirectStandardOutput $hout -RedirectStandardError $herrL
+                Start-Sleep -Seconds 15
+                $alive = (-not $bp.HasExited)
+                $wins = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { "pid=$($_.Id) title=[$($_.MainWindowTitle)]" })
+                EmitDetail "P3h $tag headed launch$suffix alive=$alive exit=$(if ($bp.HasExited) { $bp.ExitCode } else { 'running' }) windows=[$($wins -join ', ')]"
+                if (-not $alive) { $script:P3hNote = "headed browser exited early code=$($bp.ExitCode)"; return $false }
+                $dt = ''
+                try {
+                  $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/json/version" -UseBasicParsing -TimeoutSec 8
+                  $j = $r.Content | ConvertFrom-Json
+                  $dt = [string]$j.Browser
+                } catch { $dt = "error: $($_.Exception.Message)" }
+                EmitDetail "P3h $tag devtools /json/version = $dt"
+                if (-not $dt -or $dt.StartsWith('error')) {
+                  Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+                  $script:P3hNote = "devtools endpoint not reachable ($dt)"
+                  return $false
+                }
+                return $true
               }
-              $candidates = @()
-              foreach ($t in @('browser://policy/', 'chrome://policy/')) {
-                $safe = ($t -replace '[^a-zA-Z]', '_')
-                $cdpOut = Join-Path $env:SPIKE "p3h-$tag-$safe.html"
-                $null = & $cdpScript -App $app -Url $t -OutFile $cdpOut -Base $headedBase -Profile $prof -Port $port -NoLaunch -DriveNav -ReadyMs 30000
+              function Get-PageUrls {
+                try {
+                  $lr = Invoke-WebRequest -Uri "http://127.0.0.1:$port/json/list" -UseBasicParsing -TimeoutSec 5
+                  $pages = @($lr.Content | ConvertFrom-Json | Where-Object { $_.type -eq 'page' })
+                  return "$(($pages | ForEach-Object { $_.url }) -join ', ')"
+                } catch { return "error: $($_.Exception.Message)" }
+              }
+              function Test-Usable([string]$shownUrl, [string]$d) {
+                if (-not $d -or $d.Length -lt 200) { return $false }
+                if ($shownUrl -notmatch 'policy') { return $false }
+                if ($d -match 'chrome-error|ERR_INVALID|ERR_FAILED|not reached') { return $false }
+                return $true
+              }
+              function Capture-Cdp([string]$u, [string]$stage, [int]$readyMs, [switch]$drive) {
+                $safe = ($u -replace '[^a-zA-Z]', '_')
+                $cdpOut = Join-Path $env:SPIKE "p3h-$tag-$stage-$safe.html"
+                $null = & $cdpScript -App $app -Url $u -OutFile $cdpOut -Base $headedBase -Profile $prof -Port $port -NoLaunch -ReadyMs $readyMs -DriveNav:$drive
                 $cdpExit = $LASTEXITCODE
                 $cdom = $null
                 if (Test-Path $cdpOut) { $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue }
                 $clen = 0
                 if ($null -ne $cdom) { $clen = $cdom.Length }
-                EmitDetail "P3h $tag cdp url=$t exit=$cdpExit dom bytes=$clen"
-                if (($null -ne $cdom) -and ($clen -gt 200)) { $candidates += @{ url = $t; dom = $cdom } }
-                elseif ($null -eq $script:P3hNote -or $script:P3hNote -eq '') { $script:P3hNote = "$t exit=$cdpExit bytes=$clen" }
+                $actual = Get-PageUrls
+                EmitDetail "P3h $tag cdp[$stage] url=$u exit=$cdpExit dom bytes=$clen pageUrls=[$actual]"
+                $shown = $u
+                $pol = @(($actual -split ', ') | Where-Object { $_ -match 'policy' })
+                if ($pol.Count -gt 0) { $shown = $pol[0] }
+                if (Test-Usable $shown $cdom) { $script:P3hNote = ''; return @{ url = $shown; dom = $cdom } }
+                $script:P3hNote = "$u[$stage] exit=$cdpExit bytes=$clen"
+                return $null
               }
-              try {
-                $lr = Invoke-WebRequest -Uri "http://127.0.0.1:$port/json/list" -UseBasicParsing -TimeoutSec 5
-                $pages = @($lr.Content | ConvertFrom-Json | Where-Object { $_.type -eq 'page' })
-                EmitDetail "P3h $tag page urls after attempts=[$(($pages | ForEach-Object { $_.url }) -join ', ')]"
-              } catch { EmitDetail "P3h $tag json/list: $($_.Exception.Message)" }
+              function Select-Best($list) {
+                foreach ($c in $list) { if ($c.dom -match 'YandexAliceMsgDisable') { return $c } }
+                foreach ($c in $list) { if ($c.dom -notmatch 'chrome-error|ERR_INVALID|ERR_FAILED|not reached') { return $c } }
+                if ($list.Count -gt 0) { return ($list | Sort-Object { $_.dom.Length } | Select-Object -Last 1) }
+                return $null
+              }
+              if (-not (Launch-Headed 'about:blank' '')) { return }
+              $candidates = @()
+              foreach ($u in @('browser://policy/', 'chrome://policy/')) {
+                $c = Capture-Cdp $u 's1' 30000 -drive
+                if ($null -ne $c) { $candidates += $c }
+              }
+              $best = Select-Best $candidates
+              if ($null -eq $best) {
+                EmitDetail "P3h $tag stage2: fresh CDP attach to the committed target (the DriveNav session dies at the renderer swap)"
+                foreach ($u in @('chrome://policy/', 'browser://policy/')) {
+                  $c = Capture-Cdp $u 's2' 8000
+                  if ($null -ne $c) { $candidates += $c }
+                  $best = Select-Best $candidates
+                  if ($null -ne $best) { break }
+                }
+              }
+              if ($null -eq $best) {
+                EmitDetail "P3h $tag stage3: restart headed with chrome://policy/ as the startup URL so the commit happens before we attach"
+                Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+                if (Launch-Headed 'chrome://policy/' '-2') {
+                  $c = Capture-Cdp 'chrome://policy/' 's3' 20000
+                  if ($null -ne $c) { $candidates += $c }
+                  $best = Select-Best $candidates
+                }
+              }
               Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
               Start-Sleep -Seconds 2
-              $best = $null
-              foreach ($c in $candidates) { if ($c.dom -match 'YandexAliceMsgDisable') { $best = $c; break } }
-              if ($null -eq $best) { foreach ($c in $candidates) { if ($c.dom -notmatch 'chrome-error|ERR_INVALID|not reached') { $best = $c; break } } }
-              if (($null -eq $best) -and ($candidates.Count -gt 0)) { $best = ($candidates | Sort-Object { $_.dom.Length } | Select-Object -Last 1) }
               if ($null -eq $best) {
-                if ($script:P3hNote -eq '') { $script:P3hNote = 'no policy page committed on either URL' }
+                if ($script:P3hNote -eq '') { $script:P3hNote = 'no policy page rendered after drive, re-attach and startup-url stages' }
                 return
               }
               $script:P3hDom = [string]$best.dom
