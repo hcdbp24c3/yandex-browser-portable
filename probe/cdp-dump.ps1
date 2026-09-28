@@ -73,11 +73,11 @@ try {
     Log "no page target within ${timeoutMs}ms (last=$last)"
     return $null
   }
-  $driveNav = $false
+  $navDriven = $false
   if ($DriveNav) {
     $target = Get-AnyPage 8000
     if ($null -eq $target) { exit 3 }
-    $driveNav = $true
+    $navDriven = $true
     Log 'DriveNav: attaching to first page target; navigation will be driven over CDP'
   } else {
     $target = Find-Target
@@ -133,7 +133,7 @@ try {
   }
   if (-not $enabled) { throw 'Runtime.enable failed after 2 attempts' }
 
-  if ($driveNav) {
+  if ($navDriven) {
     $null = Invoke-Cdp 'Page.enable' @{}
     $null = Invoke-Cdp 'Page.navigate' @{ url = $Url }
     Log "Page.navigate issued for $Url"
