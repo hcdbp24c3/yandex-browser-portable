@@ -329,10 +329,23 @@ try {
         else { Log "domain-scan $m -> OK" }
       } catch { Log "domain-scan $m -> exception: $($_.Exception.Message)" }
     }
+    # printToPDF runs browser-side and has been observed ALLOWED even where
+    # every other domain returns Forbidden - keep the artifact for the report
     try {
       $pdf = Invoke-Cdp 'Page.printToPDF' @{ printBackground = $true }
       if ($pdf.PSObject.Properties['error']) { Log "domain-scan Page.printToPDF -> error: $($pdf.error.message)" }
-      else { Log "domain-scan Page.printToPDF -> OK bytes=$(@($pdf.result.data).Length)" }
+      else {
+        $b64 = ''
+        if ($null -ne $pdf.result -and $pdf.result.PSObject.Properties['data']) { $b64 = [string]$pdf.result.data }
+        Log "domain-scan Page.printToPDF -> OK base64 bytes=$($b64.Length)"
+        if ($b64.Length -gt 64) {
+          $pdfPath = $OutFile + '.pdf'
+          try {
+            [IO.File]::WriteAllBytes($pdfPath, [Convert]::FromBase64String($b64))
+            Log "saved printToPDF artifact: $pdfPath ($((Get-Item $pdfPath).Length) bytes)"
+          } catch { Log "printToPDF save failed: $($_.Exception.Message)" }
+        }
+      }
     } catch { Log "domain-scan Page.printToPDF -> exception: $($_.Exception.Message)" }
   }
   if (-not $html) { throw 'no DOM: outerHTML, DOM.getOuterHTML, Page.captureSnapshot and Accessibility tree all produced nothing' }

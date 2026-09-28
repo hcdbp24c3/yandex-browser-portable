@@ -968,6 +968,55 @@ jobs:
                   if ($null -ne $best) { break }
                 }
               }
+              # CDP is Forbidden on WebUI targets; the rendered page is still readable
+              # through Windows UI Automation (browser launched with
+              # --force-renderer-accessibility so the renderer exposes its tree).
+              # Try while the Policies window is still alive (before the stage3
+              # relaunch destroys it) and once more after a startup-url relaunch.
+              function Try-Uia([string]$stage) {
+                try {
+                  $wins = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { "pid=$($_.Id) title=[$($_.MainWindowTitle)]" })
+                  $pw = @($wins | Where-Object { $_ -match 'title=\[.*[Pp]olic' })
+                  if ($pw.Count -gt 0) { $script:P3hWinTitle = ($pw -join ', ') }
+                  EmitDetail "P3h $tag uia[$stage] window evidence=[$($script:P3hWinTitle)]"
+                  $uiaScript = Join-Path (Get-Location).Path 'probe/uia-dump.ps1'
+                  $uiaOut = Join-Path $env:SPIKE "p3h-$tag-$stage-uia.txt"
+                  $bpIds = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+                  $psExe = Get-Command powershell.exe -ErrorAction SilentlyContinue
+                  if ($bpIds.Count -eq 0 -or -not $psExe -or -not (Test-Path $uiaScript)) {
+                    EmitDetail "P3h $tag uia[$stage] skipped (pids=$($bpIds.Count) psExe=$([bool]$psExe) script=$(Test-Path $uiaScript))"
+                    return $null
+                  }
+                  $uiaP = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden -Wait -ArgumentList @(
+                    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $uiaScript,
+                    '-ProcIds', ($bpIds -join ','), '-OutFile', $uiaOut)
+                  EmitDetail "P3h $tag uia[$stage] exit=$($uiaP.ExitCode)"
+                  if (-not (Test-Path $uiaOut)) { return $null }
+                  $ut = Get-Content $uiaOut -Raw -ErrorAction SilentlyContinue
+                  $ulen = 0; if ($null -ne $ut) { $ulen = $ut.Length }
+                  EmitDetail "P3h $tag uia[$stage] text bytes=$ulen"
+                  if ($ulen -lt 600) { return $null }
+                  $actual = Get-PageUrls
+                  $shown = $null
+                  $pol = @(($actual -split ', ') | Where-Object { $_ -match 'policy' })
+                  if ($pol.Count -gt 0) { $shown = $pol[0] }
+                  elseif (-not $actual -or $actual -like 'error:*') { $shown = 'chrome://policy/' }
+                  if ($null -ne $shown -and (Test-Usable $shown $ut)) {
+                    EmitDetail "P3h $tag uia[$stage] candidate accepted (shown=$shown bytes=$ulen)"
+                    return @{ url = $shown; dom = $ut }
+                  }
+                  EmitDetail "P3h $tag uia[$stage] text rejected (shown=$shown)"
+                  return $null
+                } catch {
+                  EmitDetail "P3h $tag uia[$stage] attempt failed: $($_.Exception.Message)"
+                  return $null
+                }
+              }
+              if ($null -eq $best) {
+                EmitDetail "P3h $tag UIA attempt before the destructive stage3 relaunch"
+                $c = Try-Uia 'pre'
+                if ($null -ne $c) { $script:P3hVia = 'uia'; $candidates += $c; $best = Select-Best $candidates }
+              }
               if ($null -eq $best) {
                 EmitDetail "P3h $tag stage3: restart headed with chrome://policy/ as the startup URL so the commit happens before we attach"
                 Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
@@ -984,48 +1033,11 @@ jobs:
                   if ($null -ne $c) { $candidates += $c }
                   $best = Select-Best $candidates
                 }
-              }
-              if ($null -eq $best) {
-                # refresh policy-window evidence (title updates only after navigation)
-                $wins = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { "pid=$($_.Id) title=[$($_.MainWindowTitle)]" })
-                $pw = @($wins | Where-Object { $_ -match 'title=\[.*[Pp]olic' })
-                if ($pw.Count -gt 0) { $script:P3hWinTitle = ($pw -join ', ') }
-                EmitDetail "P3h $tag policy window evidence=[$($script:P3hWinTitle)] - all CDP extraction failed; attempting UIA text read"
-                # CDP is Forbidden on WebUI targets; the rendered page is still readable
-                # through Windows UI Automation (browser launched with
-                # --force-renderer-accessibility so the renderer exposes its tree)
-                try {
-                  $uiaScript = Join-Path (Get-Location).Path 'probe/uia-dump.ps1'
-                  $uiaOut = Join-Path $env:SPIKE "p3h-$tag-uia.txt"
-                  $bpIds = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-                  $psExe = Get-Command powershell.exe -ErrorAction SilentlyContinue
-                  if ($bpIds.Count -gt 0 -and $psExe -and (Test-Path $uiaScript)) {
-                    $uiaP = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden -Wait -ArgumentList @(
-                      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $uiaScript,
-                      '-ProcIds', ($bpIds -join ','), '-OutFile', $uiaOut)
-                    EmitDetail "P3h $tag uia-dump exit=$($uiaP.ExitCode)"
-                    if (Test-Path $uiaOut) {
-                      $ut = Get-Content $uiaOut -Raw -ErrorAction SilentlyContinue
-                      $ulen = 0; if ($null -ne $ut) { $ulen = $ut.Length }
-                      EmitDetail "P3h $tag uia text bytes=$ulen"
-                      if ($ulen -ge 600) {
-                        $actual = Get-PageUrls
-                        $shown = $null
-                        $pol = @(($actual -split ', ') | Where-Object { $_ -match 'policy' })
-                        if ($pol.Count -gt 0) { $shown = $pol[0] }
-                        elseif (-not $actual -or $actual -like 'error:*') { $shown = 'chrome://policy/' }
-                        if ($null -ne $shown -and (Test-Usable $shown $ut)) {
-                          $script:P3hNote = ''
-                          $script:P3hVia = 'uia'
-                          $best = @{ url = $shown; dom = $ut }
-                          EmitDetail "P3h $tag UIA candidate accepted (shown=$shown bytes=$ulen)"
-                        } else { EmitDetail "P3h $tag uia text rejected (shown=$shown)" }
-                      }
-                    }
-                  } else {
-                    EmitDetail "P3h $tag uia-dump skipped (pids=$($bpIds.Count) psExe=$([bool]$psExe) script=$(Test-Path $uiaScript))"
-                  }
-                } catch { EmitDetail "P3h $tag uia attempt failed: $($_.Exception.Message)" }
+                if ($null -eq $best) {
+                  EmitDetail "P3h $tag UIA attempt after the startup-url relaunch"
+                  $c = Try-Uia 'post'
+                  if ($null -ne $c) { $script:P3hVia = 'uia'; $candidates += $c; $best = Select-Best $candidates }
+                }
               }
               Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
               Start-Sleep -Seconds 2
