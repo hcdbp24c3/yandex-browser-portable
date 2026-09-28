@@ -1,0 +1,584 @@
+name: Spike
+
+# Task 0 spike for yandex-browser-portable (helium issue #8).
+# Answers four questions on a real windows-latest runner and emits EXACTLY
+# FOUR machine-readable verdict lines, one per probe, in this format:
+#   P<n> verdict: PASS|FAIL|HONORED|IGNORED|FALLBACK - <details>
+# (P1/P4 = PASS|FAIL, P2 = PASS|FALLBACK, P3 = HONORED|IGNORED)
+# Sub-probes (P3a, P2b, P3b) only emit "detail: ..." lines so they can never
+# collide with the grep used to count verdict lines.
+#
+# pwsh authoring rules honored here: no backtick-escaped quotes inside
+# double-quoted strings, no '#' inside step names, no '${{' interpolation
+# inside run bodies, verdict/detail lines are also written with Write-Host so
+# they are scrapeable from the job log.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  spike:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare workspace
+        id: prep
+        if: always()
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'spike'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          foreach ($sub in @('pkg', 'profiles')) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $dir $sub) | Out-Null
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "SPIKE=$dir" -Encoding utf8
+          $probe = Join-Path (Get-Location).Path 'probe\eme-probe.html'
+          Add-Content -Path $env:GITHUB_ENV -Value "PROBE=$probe" -Encoding utf8
+          $seven = Get-Command 7z -ErrorAction SilentlyContinue
+          if ($seven) {
+            Add-Content -Path $env:GITHUB_ENV -Value "SEVENZIP=$($seven.Source)" -Encoding utf8
+            Write-Host "7z at $($seven.Source)"
+          } else {
+            $dst = Join-Path $dir '7zr.exe'
+            curl.exe -fsSL -o $dst https://www.7-zip.org/a/7zr.exe
+            Write-Host "7zr download exit=$LASTEXITCODE"
+            Add-Content -Path $env:GITHUB_ENV -Value "SEVENZIP=$dst" -Encoding utf8
+          }
+          Write-Host "workspace=$dir"
+          exit 0
+
+      - name: P1 extract winget installer
+        id: p1
+        if: always()
+        run: |
+          if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
+          if (-not $env:SEVENZIP) { $env:SEVENZIP = '7z' }
+          function EmitVerdict([string]$id, [string]$v) {
+            $line = "$id verdict: $v"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'verdicts.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          function EmitDetail([string]$m) {
+            $line = "detail: $m"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'details.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          $v = 'FAIL - probe did not run'
+          try {
+            $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json' }
+            $list = Invoke-RestMethod -Headers $h 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/y/Yandex/Browser'
+            $names = @($list | ForEach-Object { $_.name })
+            if ($names.Count -eq 0) { throw 'winget manifest listing is empty' }
+            $latest = $names | Sort-Object { try { [version]$_ } catch { [version]'0.0.0.0' } } | Select-Object -Last 1
+            EmitDetail "winget manifests: $($names.Count) entries; latest=$latest"
+
+            $mfUrl = "https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/y/Yandex/Browser/$latest/Yandex.Browser.installer.yaml"
+            $mf = (Invoke-WebRequest -Uri $mfUrl -UseBasicParsing).Content
+            $pkgVer = $latest
+            if ($mf -match 'PackageVersion:\s*(\S+)') { $pkgVer = $Matches[1] }
+            $urls = @([regex]::Matches($mf, '(?m)^\s*InstallerUrl:\s*(\S+)') | ForEach-Object { $_.Groups[1].Value })
+            $installerUrl = @($urls | Where-Object { $_ -match 'download\.cdn\.yandex\.net' })[0]
+            if (-not $installerUrl) { $installerUrl = @($urls)[0] }
+            if (-not $installerUrl) { throw 'no InstallerUrl found in winget manifest' }
+            EmitDetail "PackageVersion=$pkgVer; InstallerUrl=$installerUrl"
+
+            $exe = Join-Path $env:SPIKE 'Yandex.exe'
+            curl.exe -fsSL --retry 3 --retry-delay 2 -o $exe $installerUrl
+            if ($LASTEXITCODE -ne 0) { throw "installer download failed curl exit=$LASTEXITCODE" }
+            $size = (Get-Item $exe).Length
+            EmitDetail "Yandex.exe bytes=$size"
+
+            # branch A: treat the installer itself as a 7z payload (nested 7z too)
+            $stageA = Join-Path $env:SPIKE 'extractA'
+            New-Item -ItemType Directory -Force -Path $stageA | Out-Null
+            $listOut = & $env:SEVENZIP l $exe | Out-String
+            $isArchive = ($LASTEXITCODE -eq 0) -and ($listOut -match 'Type =')
+            EmitDetail "branch A probe: 7z list exit=$LASTEXITCODE isArchive=$isArchive"
+            $appRoot = ''
+            if ($isArchive) {
+              $null = & $env:SEVENZIP x $exe "-o$stageA" -y
+              EmitDetail "branch A extract exit=$LASTEXITCODE"
+              $seen = @()
+              for ($lvl = 0; $lvl -lt 3; $lvl++) {
+                $archives = @(Get-ChildItem -Path $stageA -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.7z', '.zip', '.rar' })
+                $fresh = @($archives | Where-Object { $_.FullName -notin $seen })
+                if ($fresh.Count -eq 0) { break }
+                foreach ($a in $fresh) {
+                  $seen += $a.FullName
+                  $dest = Join-Path $a.DirectoryName ('x_' + $a.BaseName)
+                  New-Item -ItemType Directory -Force -Path $dest | Out-Null
+                  $null = & $env:SEVENZIP x $a.FullName "-o$dest" -y
+                  EmitDetail "nested archive $($a.Name) extract exit=$LASTEXITCODE"
+                }
+              }
+              $be = Get-ChildItem -Path $stageA -Recurse -File -Filter 'browser.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($be) { $branch = 'A (7z payload extract)'; $appRoot = $be.Directory.FullName }
+            }
+
+            # branch B: silent install then harvest the versioned Application dir
+            if (-not $appRoot) {
+              EmitDetail 'branch A yielded no browser.exe; running branch B (silent install harvest)'
+              $ip = Start-Process -FilePath $exe -ArgumentList '--silent', '--do-not-launch-browser' -PassThru -NoNewWindow
+              if (-not $ip.WaitForExit(600000)) { $ip.Kill($true); throw 'branch B silent install timed out after 600s' }
+              EmitDetail "branch B install exit=$($ip.ExitCode) (winget success codes are 1 and 3)"
+              $branch = 'B (silent install harvest)'
+              $appBase = Join-Path $env:LOCALAPPDATA 'Yandex\YandexBrowser\Application'
+              if (-not (Test-Path $appBase)) { throw "branch B: missing $appBase" }
+              $bes = @(Get-ChildItem -Path $appBase -Recurse -File -Filter 'browser.exe' -ErrorAction SilentlyContinue)
+              if ($bes.Count -eq 0) { throw "branch B: no browser.exe under $appBase" }
+              $be = $bes | Sort-Object { try { [version]$_.Directory.Name } catch { [version]'0.0.0.0' } } | Select-Object -Last 1
+              $appRoot = $be.Directory.FullName
+            }
+            EmitDetail "extracted app root: $appRoot"
+
+            # flat-layout candidate: copy the app tree into pkg\Yandex
+            $pkgApp = Join-Path $env:SPIKE 'pkg\Yandex'
+            New-Item -ItemType Directory -Force -Path $pkgApp | Out-Null
+            Copy-Item -Path (Join-Path $appRoot '*') -Destination $pkgApp -Recurse -Force
+            if (-not (Test-Path (Join-Path $pkgApp 'browser.exe'))) { throw 'browser.exe missing after layout copy' }
+
+            # WidevineCdm hunt: inside the app dir, and up two parent levels
+            $cdmHits = @()
+            foreach ($r in @($appRoot, (Split-Path -Parent $appRoot), (Split-Path -Parent (Split-Path -Parent $appRoot)))) {
+              if ($r -and (Test-Path $r)) {
+                $cdmHits += @(Get-ChildItem -Path $r -Recurse -Directory -Filter 'WidevineCdm' -ErrorAction SilentlyContinue)
+              }
+            }
+            $cdmHits = @($cdmHits | Sort-Object FullName -Unique)
+            $cdmLoc = 'ABSENT'
+            if ($cdmHits.Count -gt 0) { $cdmLoc = ($cdmHits | ForEach-Object { $_.FullName }) -join ' | ' }
+            $pkgCdm = Test-Path (Join-Path $pkgApp 'WidevineCdm')
+            $nested = @($cdmHits | Where-Object { $_.FullName.StartsWith($pkgApp) } | ForEach-Object { $_.FullName.Substring($pkgApp.Length) })
+            if (-not $pkgCdm -and $cdmHits.Count -gt 0) {
+              Add-Content -Path $env:GITHUB_ENV -Value "CDM_SRC=$($cdmHits[0].FullName)" -Encoding utf8
+              EmitDetail "WidevineCdm not inside app dir; export CDM_SRC=$($cdmHits[0].FullName) for the P4 flat copy"
+            }
+
+            $entries = @(Get-ChildItem -Path $pkgApp -Force | ForEach-Object { if ($_.PSIsContainer) { $_.Name + '/' } else { $_.Name } })
+            $tree = $entries -join ', '
+            $treeShort = $tree
+            if ($treeShort.Length -gt 600) { $treeShort = $treeShort.Substring(0, 600) + '...' }
+            $flags = @(
+              "browser.exe=$(Test-Path (Join-Path $pkgApp 'browser.exe'))"
+              "version.dll=$(Test-Path (Join-Path $pkgApp 'version.dll'))"
+              "service_update.exe=$(Test-Path (Join-Path $pkgApp 'service_update.exe'))"
+              "yupdate-exec.exe=$(Test-Path (Join-Path $pkgApp 'yupdate-exec.exe'))"
+              "Installer=$(Test-Path (Join-Path $pkgApp 'Installer'))"
+              "WidevineCdm(appdir)=$pkgCdm"
+              "nestedCdm=$($nested -join ',')"
+            ) -join ' '
+            EmitDetail "top-level tree: $tree"
+            EmitDetail "flags: $flags"
+            EmitDetail "WidevineCdm source location: $cdmLoc"
+            EmitDetail "version.txt candidate (winget PackageVersion)=$pkgVer; source dir name=$(Split-Path -Leaf $appRoot)"
+
+            $v = "PASS - branch=$branch; version=$pkgVer; WidevineCdm=$cdmLoc; tree=$treeShort"
+          } catch {
+            $v = "FAIL - $($_.Exception.Message)"
+          }
+          EmitVerdict 'P1' $v
+          exit 0
+
+      - name: P3a baseline policy dump
+        id: p3a
+        if: always()
+        run: |
+          if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
+          function EmitDetail([string]$m) {
+            $line = "detail: $m"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'details.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          function EmitVerdict([string]$id, [string]$v) {
+            $line = "$id verdict: $v"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'verdicts.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          try {
+            $exe = Join-Path $env:SPIKE 'pkg\Yandex\browser.exe'
+            if (-not (Test-Path $exe)) { throw 'browser.exe missing (P1 did not produce a tree)' }
+            # baseline MUST be captured before any policy key is written (reg add runs in P3b)
+            $out = Join-Path $env:SPIKE 'p3a-policy-out.txt'
+            $err = Join-Path $env:SPIKE 'p3a-policy-err.txt'
+            $prof = Join-Path $env:SPIKE 'profiles\p3a'
+            $argList = @('--headless', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', "--user-data-dir=$prof", '--virtual-time-budget=15000', '--dump-dom', 'browser://policy/')
+            $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+            if (-not $p.WaitForExit(90000)) { $p.Kill($true); $p.WaitForExit(5000); EmitDetail 'P3a dump exceeded 90s and was killed' }
+            Stop-Process -Name browser -Force -ErrorAction SilentlyContinue
+            $dom = ''
+            if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
+            if ($null -eq $dom) { $dom = '' }
+            Set-Content -Path (Join-Path $env:SPIKE 'p3a-baseline.txt') -Value $dom -Encoding utf8
+            $hasKey = $dom -match 'YandexAliceMsgDisable'
+            $pageOk = ($dom -match 'browser://policy') -or ($dom.Length -gt 500)
+            EmitDetail "P3a baseline dom bytes=$($dom.Length); rendered=$pageOk; YandexAliceMsgDisable present=$hasKey (expected False before reg add)"
+            if ($hasKey) { EmitDetail 'P3a WARNING: test key already present in the baseline dump; P3b verdict may be unreliable' }
+            if (-not $pageOk) { EmitDetail 'P3a WARNING: baseline dump looks empty; browser://policy may not render headless' }
+          } catch {
+            EmitDetail "P3a error: $($_.Exception.Message)"
+          }
+          exit 0
+
+      - name: P2 Chrome plus compatibility
+        id: p2
+        if: always()
+        run: |
+          if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
+          if (-not $env:SEVENZIP) { $env:SEVENZIP = '7z' }
+          function EmitVerdict([string]$id, [string]$v) {
+            $line = "$id verdict: $v"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'verdicts.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          function EmitDetail([string]$m) {
+            $line = "detail: $m"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'details.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          $v = 'FALLBACK - probe did not run'
+          try {
+            $app = Join-Path $env:SPIKE 'pkg\Yandex'
+            $exe = Join-Path $app 'browser.exe'
+            if (-not (Test-Path $exe)) { throw 'browser.exe missing (P1 did not produce a tree)' }
+            $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json' }
+            $rel = Invoke-RestMethod -Headers $h 'https://api.github.com/repos/bibicadotnet/Chromium_SetDLL/releases/latest'
+            $asset = $rel.assets | Where-Object { $_.name -match 'Chrome.*\.7z$' } | Select-Object -First 1
+            if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -match '\.7z$|\.zip$' } | Select-Object -First 1 }
+            if (-not $asset) { throw 'no Chrome++ asset on the pinned latest release' }
+            $assetUrl = $asset.browser_download_url
+            EmitDetail "Chrome++ release=$($rel.tag_name) asset=$($asset.name) url=$assetUrl"
+            $cpp = Join-Path $env:SPIKE ('chrome_plus' + [IO.Path]::GetExtension($asset.name))
+            curl.exe -fsSL --retry 3 --retry-delay 2 -o $cpp $assetUrl
+            if ($LASTEXITCODE -ne 0) { throw "Chrome++ download failed curl exit=$LASTEXITCODE" }
+            $xd = Join-Path $env:SPIKE 'cpp'
+            New-Item -ItemType Directory -Force -Path $xd | Out-Null
+            $null = & $env:SEVENZIP x $cpp "-o$xd" -y
+            if ($LASTEXITCODE -ne 0) { throw "Chrome++ extract failed exit=$LASTEXITCODE" }
+            $dlls = @(Get-ChildItem -Path $xd -Recurse -File -Filter 'version.dll' -ErrorAction SilentlyContinue)
+            $dll = $dlls | Where-Object { $_.FullName -like '*\x64\App\*' } | Select-Object -First 1
+            if (-not $dll) { $dll = $dlls | Where-Object { $_.FullName -like '*\x64*' } | Select-Object -First 1 }
+            if (-not $dll) { throw "no x64 version.dll in Chrome++ archive (dlls found=$($dlls.Count))" }
+            EmitDetail "Chrome++ version.dll: $($dll.FullName)"
+
+            function Invoke-Dump([string]$tag) {
+              $o = Join-Path $env:SPIKE "p2-$tag-out.txt"
+              $e2 = Join-Path $env:SPIKE "p2-$tag-err.txt"
+              $prof = Join-Path $env:SPIKE "profiles\$tag"
+              $argList = @('--headless', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', "--user-data-dir=$prof", '--dump-dom', 'about:blank')
+              $pr = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -RedirectStandardOutput $o -RedirectStandardError $e2
+              if (-not $pr.WaitForExit(60000)) { $pr.Kill($true); $pr.WaitForExit(5000) }
+              Stop-Process -Name browser -Force -ErrorAction SilentlyContinue
+              $len = 0
+              if (Test-Path $o) { $len = (Get-Item $o).Length }
+              return $len
+            }
+
+            $dllTarget = Join-Path $app 'version.dll'
+            $withLen = -1
+            Copy-Item -Path $dll.FullName -Destination $dllTarget -Force
+            try { $withLen = Invoke-Dump 'with-dll' } catch { EmitDetail "P2 dump with DLL failed: $($_.Exception.Message)" }
+            Remove-Item -Path $dllTarget -Force -ErrorAction SilentlyContinue
+            $noLen = -1
+            try { $noLen = Invoke-Dump 'no-dll' } catch { EmitDetail "P2 dump without DLL failed: $($_.Exception.Message)" }
+            EmitDetail "P2 dump-dom output bytes: withDLL=$withLen withoutDLL=$noLen (Helium lesson: version.dll may silence --dump-dom on CI)"
+
+            # chicken-egg: the candidate ini must exist before the portable run
+            $iniLines = @(
+              '[general]'
+              'data_dir=%app%\..\Data'
+              'cache_dir=%app%\..\Cache'
+              'command_line=--no-first-run --no-default-browser-check'
+              'launch_on_startup='
+              'launch_on_exit='
+              'boss_key='
+              'translate_key='
+              'show_password=0'
+              'win32k=0'
+              'ignore_policies=0'
+              'policy_key=Portable'
+            )
+            Set-Content -Path (Join-Path $app 'chrome++.ini') -Value $iniLines -Encoding utf8
+            EmitDetail 'candidate chrome++.ini copied next to browser.exe (WITHOUT --disable-component-update)'
+            Copy-Item -Path $dll.FullName -Destination $dllTarget -Force
+            Add-Content -Path $env:GITHUB_ENV -Value "P2_DLL=$($dll.FullName)" -Encoding utf8
+
+            $parent = Split-Path -Parent $app
+            foreach ($d in @('Data', 'Cache')) {
+              $tp = Join-Path $parent $d
+              if (Test-Path $tp) { Remove-Item -Path $tp -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+            $bp = Start-Process -FilePath $exe -PassThru -NoNewWindow
+            Start-Sleep -Seconds 12
+            $alive = -not $bp.HasExited
+            $exitCode = 'running'
+            if ($bp.HasExited) { $exitCode = $bp.ExitCode }
+            $dataOk = Test-Path (Join-Path $parent 'Data')
+            $cacheOk = Test-Path (Join-Path $parent 'Cache')
+            Stop-Process -Name browser -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            EmitDetail "P2 normal launch: alive=$alive exit=$exitCode Data=$dataOk Cache=$cacheOk parent=$parent"
+
+            $crashed = (-not $alive) -and ($exitCode -ne 'running') -and ($exitCode -ne 0)
+            if ($crashed -and (-not $dataOk) -and (-not $cacheOk)) {
+              $v = "FALLBACK - browser crashed with version.dll present (exit=$exitCode) and no portable dirs; use --user-data-dir launcher"
+            } elseif ($dataOk -or $cacheOk) {
+              $v = "PASS - version.dll loads into browser.exe; portable Data=$dataOk Cache=$cacheOk at %app%\..; dump bytes withDLL=$withLen vs withoutDLL=$noLen"
+            } else {
+              $v = "FALLBACK - browser alive=$alive exit=$exitCode but no portable Data/Cache next to exe; use --user-data-dir launcher"
+            }
+          } catch {
+            $v = "FALLBACK - $($_.Exception.Message)"
+          }
+          EmitVerdict 'P2' $v
+          exit 0
+
+      - name: P2b ini relative data dir
+        id: p2b
+        if: always()
+        run: |
+          if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
+          function EmitDetail([string]$m) {
+            $line = "detail: $m"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'details.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          function EmitVerdict([string]$id, [string]$v) {
+            $line = "$id verdict: $v"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'verdicts.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          try {
+            $app = Join-Path $env:SPIKE 'pkg\Yandex'
+            $exe = Join-Path $app 'browser.exe'
+            if (-not (Test-Path $exe)) { throw 'browser.exe missing (P1 did not produce a tree)' }
+            $ini = Join-Path $app 'chrome++.ini'
+            if (-not (Test-Path $ini)) { throw 'chrome++.ini missing (P2 step did not run)' }
+            $iniRaw = Get-Content $ini -Raw
+            $clean = -not ($iniRaw -match 'disable-component-update')
+            EmitDetail "P2b ini next to browser.exe; no-disable-component-update=$clean"
+            if (-not $clean) { throw 'candidate ini contains --disable-component-update (forbidden)' }
+            $dllTarget = Join-Path $app 'version.dll'
+            if (-not (Test-Path $dllTarget)) {
+              if ($env:P2_DLL -and (Test-Path $env:P2_DLL)) { Copy-Item -Path $env:P2_DLL -Destination $dllTarget -Force }
+              else { throw 'version.dll unavailable for the P2b relaunch' }
+            }
+            $parent = Split-Path -Parent $app
+            $data = Join-Path $parent 'Data'
+            if (Test-Path $data) { Remove-Item -Path $data -Recurse -Force -ErrorAction SilentlyContinue }
+            $bp = Start-Process -FilePath $exe -PassThru -NoNewWindow
+            Start-Sleep -Seconds 12
+            $dataOk = Test-Path $data
+            $alive = -not $bp.HasExited
+            Stop-Process -Name browser -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            EmitDetail "P2b relaunch alive=$alive; %app%\..\Data exists=$dataOk (resolved path=$data)"
+            if (-not $dataOk) { EmitDetail 'P2b WARNING: relative data_dir did not materialize; Task 3 ini needs tuning' }
+          } catch {
+            EmitDetail "P2b error: $($_.Exception.Message)"
+          }
+          exit 0
+
+      - name: P3b policy honoring
+        id: p3b
+        if: always()
+        run: |
+          if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
+          function EmitVerdict([string]$id, [string]$v) {
+            $line = "$id verdict: $v"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'verdicts.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          function EmitDetail([string]$m) {
+            $line = "detail: $m"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'details.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          $regKey = 'HKLM\SOFTWARE\Policies\YandexBrowser'
+          $keyExisted = $false
+          $v = 'IGNORED - probe did not run'
+          try {
+            $app = Join-Path $env:SPIKE 'pkg\Yandex'
+            $exe = Join-Path $app 'browser.exe'
+            if (-not (Test-Path $exe)) { throw 'browser.exe missing (P1 did not produce a tree)' }
+            $dllPath = Join-Path $app 'version.dll'
+            if (Test-Path $dllPath) {
+              Move-Item -Path $dllPath -Destination "$dllPath.aside" -Force -ErrorAction SilentlyContinue
+              EmitDetail 'P3b version.dll moved aside so --dump-dom is not silenced (Helium lesson)'
+            }
+            $null = & reg.exe query $regKey
+            $keyExisted = ($LASTEXITCODE -eq 0)
+            EmitDetail "P3b policy key existed before the test: $keyExisted"
+            $null = & reg.exe add $regKey /v YandexAliceMsgDisable /t REG_DWORD /d 1 /f
+            if ($LASTEXITCODE -ne 0) { throw "reg add failed exit=$LASTEXITCODE" }
+            EmitDetail 'P3b reg add HKLM\SOFTWARE\Policies\YandexBrowser YandexAliceMsgDisable=1 (REG_DWORD)'
+
+            $out = Join-Path $env:SPIKE 'p3b-policy-out.txt'
+            $err = Join-Path $env:SPIKE 'p3b-policy-err.txt'
+            $prof = Join-Path $env:SPIKE 'profiles\p3b'
+            $argList = @('--headless', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', "--user-data-dir=$prof", '--virtual-time-budget=15000', '--dump-dom', 'browser://policy/')
+            $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+            if (-not $p.WaitForExit(90000)) { $p.Kill($true); $p.WaitForExit(5000); EmitDetail 'P3b dump exceeded 90s and was killed' }
+            Stop-Process -Name browser -Force -ErrorAction SilentlyContinue
+            $dom = ''
+            if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
+            if ($null -eq $dom) { $dom = '' }
+            Set-Content -Path (Join-Path $env:SPIKE 'p3b-policy.txt') -Value $dom -Encoding utf8
+
+            $honored = $dom -match 'YandexAliceMsgDisable'
+            $keyLines = @($dom -split "\r?\n" | Where-Object { $_ -match 'YandexAliceMsgDisable' } | ForEach-Object { $_.Trim() } | Select-Object -First 3)
+            $evidence = ($keyLines -join ' || ')
+            if ($evidence.Length -gt 400) { $evidence = $evidence.Substring(0, 400) }
+            EmitDetail "P3b policy dump bytes=$($dom.Length); matching lines=$($keyLines.Count)"
+            if ($honored) { EmitDetail "P3b evidence: $evidence" }
+            else { EmitDetail 'P3b key not present in the browser://policy dump' }
+
+            $alm = @($dom -split "\r?\n" | Where-Object { $_ -match 'YandexAutoLaunchMode' } | ForEach-Object { $_.Trim() } | Select-Object -First 3)
+            if ($alm.Count -gt 0) { EmitDetail "P3b YandexAutoLaunchMode lines: $(($alm -join ' || ').Substring(0, [Math]::Min(400, ($alm -join ' || ').Length)))" }
+            else { EmitDetail 'P3b YandexAutoLaunchMode absent from the dump (browser://policy only lists registered keys)' }
+            try {
+              $admxUrl = 'https://download.cdn.yandex.net/browser/corporate/YandexBrowser.admx'
+              $admx = (Invoke-WebRequest -Uri $admxUrl -UseBasicParsing).Content
+              $idx = $admx.IndexOf('YandexAutoLaunchMode')
+              if ($idx -ge 0) {
+                $chunk = ($admx.Substring($idx, [Math]::Min(900, $admx.Length - $idx)) -replace '\s+', ' ')
+                EmitDetail "P3b ADMX enum evidence: $chunk"
+              } else {
+                EmitDetail 'P3b ADMX has no YandexAutoLaunchMode entry'
+              }
+            } catch {
+              EmitDetail "P3b ADMX fetch failed: $($_.Exception.Message)"
+            }
+
+            if ($honored) {
+              $v = "HONORED - YandexAliceMsgDisable listed in browser://policy after reg add (evidence: $evidence)"
+            } else {
+              $v = "IGNORED - YandexAliceMsgDisable absent from browser://policy after reg add (dump bytes=$($dom.Length))"
+            }
+          } catch {
+            $v = "IGNORED - probe error: $($_.Exception.Message)"
+          } finally {
+            $null = & reg.exe delete $regKey /v YandexAliceMsgDisable /f
+            $valueGone = ($LASTEXITCODE -eq 0)
+            $removedKey = $false
+            if (-not $keyExisted) {
+              $null = & reg.exe delete $regKey /f
+              $removedKey = ($LASTEXITCODE -eq 0)
+            }
+            EmitDetail "P3b cleanup: test value removed=$valueGone; whole key removed=$removedKey"
+          }
+          EmitVerdict 'P3' $v
+          exit 0
+
+      - name: P4 EME probe
+        id: p4
+        if: always()
+        run: |
+          if (-not $env:SPIKE) { $env:SPIKE = Join-Path $env:RUNNER_TEMP 'spike'; New-Item -ItemType Directory -Force -Path $env:SPIKE | Out-Null }
+          function EmitVerdict([string]$id, [string]$v) {
+            $line = "$id verdict: $v"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'verdicts.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          function EmitDetail([string]$m) {
+            $line = "detail: $m"
+            Write-Host $line
+            Add-Content -Path (Join-Path $env:SPIKE 'details.txt') -Value $line -Encoding utf8
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
+          }
+          $v = 'FAIL - probe did not run'
+          try {
+            $app = Join-Path $env:SPIKE 'pkg\Yandex'
+            $exe = Join-Path $app 'browser.exe'
+            if (-not (Test-Path $exe)) { throw 'browser.exe missing (P1 did not produce a tree)' }
+            $dllPath = Join-Path $app 'version.dll'
+            if (Test-Path $dllPath) {
+              Move-Item -Path $dllPath -Destination "$dllPath.aside" -Force -ErrorAction SilentlyContinue
+              EmitDetail 'P4 version.dll moved aside so --dump-dom is not silenced (Helium lesson)'
+            }
+            $cdm = Join-Path $app 'WidevineCdm'
+            if (-not (Test-Path $cdm)) {
+              if ($env:CDM_SRC -and (Test-Path $env:CDM_SRC)) {
+                Copy-Item -Path $env:CDM_SRC -Destination $app -Recurse -Force
+                EmitDetail "P4 copied WidevineCdm flat from $($env:CDM_SRC) (flat exe-dir rule)"
+              } else {
+                EmitDetail 'P4 no WidevineCdm shipped next to browser.exe (CDM_SRC unset); EME likely fails'
+              }
+            }
+            $abs = ((Resolve-Path 'probe\eme-probe.html').Path) -replace '\\', '/'
+            $uri = "file:///$abs"
+            EmitDetail "P4 probe uri=$uri"
+            $out = Join-Path $env:SPIKE 'p4-out.txt'
+            $err = Join-Path $env:SPIKE 'p4-err.txt'
+            $prof = Join-Path $env:SPIKE 'profiles\p4'
+            $argList = @('--headless', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', "--user-data-dir=$prof", '--virtual-time-budget=30000', '--dump-dom', $uri)
+            $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+            if (-not $p.WaitForExit(120000)) { $p.Kill($true); $p.WaitForExit(5000); EmitDetail 'P4 exceeded 120s and was killed' }
+            Stop-Process -Name browser -Force -ErrorAction SilentlyContinue
+            $dom = ''
+            if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
+            if ($null -eq $dom) { $dom = '' }
+            $eme = 'NO_RESULT'
+            if ($dom -match '<title>CDM_OK</title>') { $eme = 'CDM_OK' }
+            elseif ($dom -match '(?s)<pre id="o">([^<]+)</pre>') {
+              $pre = $Matches[1].Trim()
+              if ($pre -ne 'pending' -and $pre -ne '') { $eme = $pre }
+            }
+            $wv = @()
+            if (Test-Path $err) { $wv = @(Get-Content $err -ErrorAction SilentlyContinue | Where-Object { $_ -match 'widevine|CDM' } | Select-Object -First 6) }
+            if ($wv.Count -gt 0) { EmitDetail "P4 CDM stderr lines: $(($wv -join ' || '))" }
+            else { EmitDetail 'P4 no widevine/CDM lines in stderr' }
+            EmitDetail "P4 dom bytes=$($dom.Length); parsed result=$eme"
+            if ($eme -eq 'CDM_OK') { $v = "PASS - CDM_OK from requestMediaKeySystemAccess (domBytes=$($dom.Length))" }
+            else { $v = "FAIL - eme=$eme (domBytes=$($dom.Length))" }
+          } catch {
+            $v = "FAIL - $($_.Exception.Message)"
+          }
+          EmitVerdict 'P4' $v
+          exit 0
+
+      - name: Findings summary
+        id: summary
+        if: always()
+        run: |
+          $dir = $env:SPIKE
+          if (-not $dir) { $dir = Join-Path $env:RUNNER_TEMP 'spike' }
+          $vf = Join-Path $dir 'verdicts.txt'
+          $lines = @()
+          if (Test-Path $vf) { $lines = @(Get-Content $vf -ErrorAction SilentlyContinue | Where-Object { $_ }) }
+          Write-Host '===== spike verdicts ====='
+          foreach ($l in $lines) {
+            $parts = $l -split ' verdict: ', 2
+            if ($parts.Count -eq 2) { Write-Host "$($parts[0]) = $($parts[1])" }
+            else { Write-Host $l }
+          }
+          Write-Host "verdict line count = $($lines.Count) (expected 4)"
+          if ($lines.Count -ne 4) { Write-Host 'WARNING: verdict line count is not 4 - check probe steps above' }
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Spike verdict lines ($($lines.Count))" -Encoding utf8
+          $df = Join-Path $dir 'details.txt'
+          if (Test-Path $df) {
+            Write-Host '===== spike details ====='
+            Get-Content $df -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+          }
+          exit 0
