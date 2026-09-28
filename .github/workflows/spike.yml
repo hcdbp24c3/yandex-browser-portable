@@ -203,6 +203,27 @@ jobs:
             Add-Content -Path (Join-Path $env:SPIKE 'details.txt') -Value $line -Encoding utf8
             Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $line -Encoding utf8
           }
+          # env contract defaults; later GITHUB_ENV writes below override these
+          Add-Content -Path $env:GITHUB_ENV -Value 'DUMP_BASE=--headless=new --disable-gpu --no-first-run --no-default-browser-check --disable-crash-reporter --enable-logging=stderr --v=1' -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value 'P0_CDP=skip' -Encoding utf8
+          $heliumBase = @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', '--enable-logging=stderr', '--v=1')
+          $plainBase = @('--headless', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter')
+          function Get-Head([string]$path, [int]$lines, [int]$max) {
+            $s = ''
+            if (Test-Path $path) { $s = (@(Get-Content $path -TotalCount $lines -ErrorAction SilentlyContinue) -join ' | ') -replace '\s+', ' ' }
+            if ($s.Length -gt $max) { $s = $s.Substring(0, $max) }
+            return $s
+          }
+          function Get-Tail([string]$path, [int]$lines, [int]$max) {
+            $s = ''
+            if (Test-Path $path) { $all = @(Get-Content $path -ErrorAction SilentlyContinue); $s = (@($all | Select-Object -Last $lines) -join ' | ') -replace '\s+', ' ' }
+            if ($s.Length -gt $max) { $s = $s.Substring(0, $max) }
+            return $s
+          }
+          function Get-Tree {
+            $p = @(Get-CimInstance Win32_Process -Filter 'Name="browser.exe" OR Name="browser_proxy.exe"' -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name):pid=$($_.ProcessId):pp=$($_.ParentProcessId)" })
+            return ($p -join ', ')
+          }
           try {
             $app = Join-Path $env:SPIKE 'pkg\Yandex'
             $exe = Join-Path $app 'browser.exe'
@@ -210,7 +231,6 @@ jobs:
             $dir = Split-Path -Parent $exe
             EmitDetail "P0 payload: browser.dll next to exe=$(Test-Path (Join-Path $app 'browser.dll')); in version dir=$(Test-Path (Join-Path $app '26.8.4.893\browser.dll'))"
 
-            # health probe: does the exe honour --version (prints and exits)?
             $vo = Join-Path $env:SPIKE 'p0-version-out.txt'
             $ve = Join-Path $env:SPIKE 'p0-version-err.txt'
             $vp = Start-Process -FilePath $exe -ArgumentList @('--version') -PassThru -NoNewWindow -WorkingDirectory $dir -RedirectStandardOutput $vo -RedirectStandardError $ve
@@ -220,12 +240,9 @@ jobs:
               $null = $vp.WaitForExit(3000); $vExit = 'killed@15s'
             } else { $vExit = $vp.ExitCode }
             Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
-            $vOut = ''
-            if (Test-Path $vo) { $vOut = ((Get-Content $vo -Raw -ErrorAction SilentlyContinue) -replace '\s+', ' ').Trim() }
-            if ($vOut.Length -gt 300) { $vOut = $vOut.Substring(0, 300) }
-            EmitDetail "P0 --version exit=$vExit out=[$vOut]"
+            EmitDetail "P0 --version exit=$vExit out=[$(Get-Head $vo 5 300)] err=[$(Get-Head $ve 5 300)]"
 
-            function Invoke-Trial([string]$tag, [string[]]$base) {
+            function Invoke-Trial([string]$tag, [string[]]$base, [int]$budgetMs) {
               $o = Join-Path $env:SPIKE "p0-$tag-out.txt"
               $e2 = Join-Path $env:SPIKE "p0-$tag-err.txt"
               $prof = Join-Path $env:SPIKE "profiles\p0-$tag"
@@ -238,62 +255,60 @@ jobs:
                 return -1
               }
               Start-Sleep -Seconds 6
-              $procs = @(Get-CimInstance Win32_Process -Filter "Name='browser.exe' OR Name='browser_proxy.exe'" -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name):pid=$($_.ProcessId):pp=$($_.ParentProcessId)" })
-              EmitDetail "P0 $tag process tree at t+6s: $($procs -join ', ')"
+              EmitDetail "P0 $tag t+6s tree=[$(Get-Tree)]"
               $mw = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { "pid=$($_.Id):window=[$($_.MainWindowTitle)]" })
-              if ($mw.Count -gt 0) { EmitDetail "P0 $tag window titles: $($mw -join ', ')" }
+              EmitDetail "P0 $tag t+6s windows=[$($mw -join ', ')]"
+              Start-Sleep -Seconds 14
+              EmitDetail "P0 $tag t+20s tree=[$(Get-Tree)]"
               $ec = 'running'
-              if (-not $pr.WaitForExit(54000)) {
+              if (-not $pr.WaitForExit($budgetMs)) {
                 try { $pr.Kill($true) } catch { EmitDetail "P0 $tag kill: $($_.Exception.Message)" }
-                $null = $pr.WaitForExit(5000); $ec = 'killed@60s'
+                $null = $pr.WaitForExit(5000); $ec = "killed@${budgetMs}ms"
               } else { $ec = $pr.ExitCode }
               Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
               Start-Sleep -Seconds 1
               $len = -1
+              $errBytes = -1
               if (Test-Path $o) { $len = (Get-Item $o).Length }
-              $eh = ''
-              if (Test-Path $e2) { $eh = (@(Get-Content $e2 -TotalCount 12 -ErrorAction SilentlyContinue) -join ' | ') -replace '\s+', ' ' }
-              if ($eh.Length -gt 700) { $eh = $eh.Substring(0, 700) }
-              EmitDetail "P0 $tag exit=$ec outBytes=$len"
-              EmitDetail "P0 $tag stderr head=[$eh]"
+              if (Test-Path $e2) { $errBytes = (Get-Item $e2).Length }
+              EmitDetail "P0 $tag exit=$ec outBytes=$len errBytes=$errBytes"
+              EmitDetail "P0 $tag stderr head=[$(Get-Head $e2 8 600)]"
+              EmitDetail "P0 $tag stderr tail=[$(Get-Tail $e2 15 900)]"
               return $len
             }
 
-            $heliumBase = @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', '--enable-logging=stderr', '--v=1')
-            $plainBase = @('--headless', '--no-first-run', '--no-default-browser-check', '--disable-crash-reporter')
-            $bHelium = Invoke-Trial 'helium-base' $heliumBase
-            $bPlain = Invoke-Trial 'plain-base' $plainBase
             $chosen = '--headless=new --disable-gpu --no-first-run --no-default-browser-check --disable-crash-reporter --enable-logging=stderr --v=1'
-            if (($bHelium -le 200) -and ($bPlain -gt 200)) { $chosen = '--headless --no-first-run --no-default-browser-check --disable-crash-reporter' }
+            $bHelium = Invoke-Trial 'helium-base' $heliumBase 45000
+            $bPlain = -1
+            if ($bHelium -le 200) { $bPlain = Invoke-Trial 'plain-base' $plainBase 45000 }
+            if (($bHelium -le 200) -and ($bPlain -gt 200)) {
+              $chosen = '--headless --no-first-run --no-default-browser-check --disable-crash-reporter'
+              EmitDetail 'P0 plain base produced dump output; DUMP_BASE switched to plain'
+            } elseif (($bHelium -le 200) -and ($bPlain -le 200)) {
+              $timeoutBase = @($heliumBase) + @('--timeout=15000')
+              $bTimeout = Invoke-Trial 'helium-timeout' $timeoutBase 45000
+              if ($bTimeout -gt 200) {
+                $chosen = '--headless=new --disable-gpu --no-first-run --no-default-browser-check --disable-crash-reporter --enable-logging=stderr --v=1 --timeout=15000'
+                EmitDetail 'P0 --timeout forced dump output; DUMP_BASE carries --timeout=15000'
+              }
+              $cdpScript = Join-Path (Get-Location).Path 'probe/cdp-dump.ps1'
+              $cdpOut = Join-Path $env:SPIKE 'p0-cdp.html'
+              & $cdpScript -App $app -Url 'about:blank' -OutFile $cdpOut -Base $heliumBase -Profile (Join-Path $env:SPIKE 'profiles\p0-cdp') -Port 9444 -ReadyMs 25000
+              $cdpExit = $LASTEXITCODE
+              $cdpBytes = -1
+              if (Test-Path $cdpOut) { $cdpBytes = (Get-Item $cdpOut).Length }
+              EmitDetail "P0 cdp probe exit=$cdpExit domBytes=$cdpBytes"
+              if (($cdpExit -eq 0) -and ($cdpBytes -gt 50)) {
+                Add-Content -Path $env:GITHUB_ENV -Value 'P0_CDP=ok' -Encoding utf8
+                EmitDetail 'P0 CDP path AVAILABLE (P0_CDP=ok); probes fall back to it when dump-dom is empty'
+              }
+            }
             Add-Content -Path $env:GITHUB_ENV -Value "DUMP_BASE=$chosen" -Encoding utf8
             EmitDetail "P0 chosen DUMP_BASE=$chosen (heliumBytes=$bHelium plainBytes=$bPlain)"
-
-            if (($bHelium -le 200) -and ($bPlain -le 200)) {
-              $prof = Join-Path $env:SPIKE 'profiles\p0-cdp'
-              $argList = $heliumBase + @("--user-data-dir=$prof", '--remote-debugging-port=9444', 'about:blank')
-              $pr = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow -WorkingDirectory $dir -RedirectStandardOutput (Join-Path $env:SPIKE 'p0-cdp-out.txt') -RedirectStandardError (Join-Path $env:SPIKE 'p0-cdp-err.txt')
-              $cdp = 'no-response'
-              foreach ($i in 1..12) {
-                Start-Sleep -Seconds 2
-                try {
-                  $r = Invoke-WebRequest -Uri 'http://127.0.0.1:9444/json/version' -UseBasicParsing -TimeoutSec 3
-                  $body = ($r.Content -replace '\s+', ' ')
-                  $cut = [Math]::Min(300, $body.Length)
-                  $cdp = "HTTP $($r.StatusCode) " + $body.Substring(0, $cut)
-                  break
-                } catch {
-                  $cdp = "attempt${i}: $($_.Exception.Message)"
-                }
-              }
-              EmitDetail "P0 cdp probe (only runs when both dump bases were empty): $cdp"
-              try { $pr.Kill($true) } catch { EmitDetail "P0 cdp kill: $($_.Exception.Message)" }
-              Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
-            }
           } catch {
             EmitDetail "P0 error: $($_.Exception.Message)"
           }
           exit 0
-
       - name: P3a baseline policy dump
         id: p3a
         if: always()
@@ -332,6 +347,16 @@ jobs:
             $dom = ''
             if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
             if ($null -eq $dom) { $dom = '' }
+            if (($dom.Length -le 500) -and ($env:P0_CDP -eq 'ok')) {
+              EmitDetail 'P3a dump-dom empty; extracting browser://policy over CDP instead'
+              $cdpOut = Join-Path $env:SPIKE 'p3a-cdp.html'
+              & (Join-Path (Get-Location).Path 'probe/cdp-dump.ps1') -App $app -Url 'browser://policy/' -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE 'profiles\p3a-cdp') -Port 9455 -ReadyMs 30000
+              if (Test-Path $cdpOut) {
+                $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue
+                if (($null -ne $cdom) -and ($cdom.Length -gt 0)) { $dom = $cdom; EmitDetail "P3a cdp dom bytes=$($dom.Length)" }
+              }
+              if ($dom.Length -le 500) { EmitDetail 'P3a cdp extraction produced no dom' }
+            }
             Set-Content -Path (Join-Path $env:SPIKE 'p3a-baseline.txt') -Value $dom -Encoding utf8
             $hasKey = $dom -match 'YandexAliceMsgDisable'
             $pageOk = ($dom -match 'browser://policy') -or ($dom.Length -gt 500)
@@ -573,6 +598,16 @@ jobs:
             $dom = ''
             if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
             if ($null -eq $dom) { $dom = '' }
+            if (($dom.Length -le 500) -and ($env:P0_CDP -eq 'ok')) {
+              EmitDetail 'P3b dump-dom empty; extracting browser://policy over CDP instead'
+              $cdpOut = Join-Path $env:SPIKE 'p3b-cdp.html'
+              & (Join-Path (Get-Location).Path 'probe/cdp-dump.ps1') -App $app -Url 'browser://policy/' -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE 'profiles\p3b-cdp') -Port 9456 -ReadyMs 30000
+              if (Test-Path $cdpOut) {
+                $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue
+                if (($null -ne $cdom) -and ($cdom.Length -gt 0)) { $dom = $cdom; EmitDetail "P3b cdp dom bytes=$($dom.Length)" }
+              }
+              if ($dom.Length -le 500) { EmitDetail 'P3b cdp extraction produced no dom' }
+            }
             Set-Content -Path (Join-Path $env:SPIKE 'p3b-policy.txt') -Value $dom -Encoding utf8
 
             $honored = $dom -match 'YandexAliceMsgDisable'
@@ -680,6 +715,16 @@ jobs:
             $dom = ''
             if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
             if ($null -eq $dom) { $dom = '' }
+            if (($dom.Length -le 500) -and ($env:P0_CDP -eq 'ok')) {
+              EmitDetail 'P4 dump-dom empty; extracting probe page over CDP (waits for the <pre id=o> result)'
+              $cdpOut = Join-Path $env:SPIKE 'p4-cdp.html'
+              & (Join-Path (Get-Location).Path 'probe/cdp-dump.ps1') -App $app -Url $uri -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE 'profiles\p4-cdp') -Port 9457 -ReadyMs 30000 -AwaitExpr '(function(){var p=document.getElementById("o");return p?p.innerText:""})()' -AwaitMs 120000
+              if (Test-Path $cdpOut) {
+                $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue
+                if (($null -ne $cdom) -and ($cdom.Length -gt 0)) { $dom = $cdom; EmitDetail "P4 cdp dom bytes=$($dom.Length)" }
+              }
+              if ($dom.Length -le 500) { EmitDetail 'P4 cdp extraction produced no dom' }
+            }
             $eme = 'NO_RESULT'
             if ($dom -match '<title>CDM_OK</title>') { $eme = 'CDM_OK' }
             elseif ($dom -match '(?s)<pre id="o">([^<]+)</pre>') {
