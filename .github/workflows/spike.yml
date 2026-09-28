@@ -348,12 +348,26 @@ jobs:
             if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
             if ($null -eq $dom) { $dom = '' }
             if (($dom.Length -le 500) -and ($env:P0_CDP -eq 'ok')) {
-              EmitDetail 'P3a dump-dom empty; extracting browser://policy over CDP instead'
-              $cdpOut = Join-Path $env:SPIKE 'p3a-cdp.html'
-              & (Join-Path (Get-Location).Path 'probe/cdp-dump.ps1') -App (Split-Path -Parent $exe) -Url 'browser://policy/' -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE 'profiles\p3a-cdp') -Port 9455 -ReadyMs 30000
-              if (Test-Path $cdpOut) {
-                $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue
-                if (($null -ne $cdom) -and ($cdom.Length -gt 0)) { $dom = $cdom; EmitDetail "P3a cdp dom bytes=$($dom.Length)" }
+              EmitDetail 'P3a dump-dom empty; extracting policy page over CDP (spec URL first, then chrome://policy/ which the binary registers)'
+              $cdpScript = Join-Path (Get-Location).Path 'probe/cdp-dump.ps1'
+              $appDir = (Split-Path -Parent $exe)
+              $tries = @(
+                @{ Url = 'browser://policy/'; Port = 9455; Ready = 10000 },
+                @{ Url = 'chrome://policy/'; Port = 9465; Ready = 30000 },
+                @{ Url = 'browser://policy'; Port = 9475; Ready = 10000 }
+              )
+              foreach ($t in $tries) {
+                $cdpOut = Join-Path $env:SPIKE "p3a-cdp-$($t.Port).html"
+                & $cdpScript -App $appDir -Url $t.Url -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE "profiles\p3a-cdp-$($t.Port)") -Port $t.Port -ReadyMs $t.Ready
+                $cdpExit = $LASTEXITCODE
+                $cdom = $null
+                if (Test-Path $cdpOut) { $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue }
+                if (($null -ne $cdom) -and ($cdom.Length -gt 500)) {
+                  $dom = $cdom
+                  EmitDetail "P3a cdp url=$($t.Url) dom bytes=$($dom.Length)"
+                  break
+                }
+                EmitDetail "P3a cdp url=$($t.Url) no dom (exit=$cdpExit)"
               }
               if ($dom.Length -le 500) { EmitDetail 'P3a cdp extraction produced no dom' }
             }
@@ -599,12 +613,26 @@ jobs:
             if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
             if ($null -eq $dom) { $dom = '' }
             if (($dom.Length -le 500) -and ($env:P0_CDP -eq 'ok')) {
-              EmitDetail 'P3b dump-dom empty; extracting browser://policy over CDP instead'
-              $cdpOut = Join-Path $env:SPIKE 'p3b-cdp.html'
-              & (Join-Path (Get-Location).Path 'probe/cdp-dump.ps1') -App $app -Url 'browser://policy/' -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE 'profiles\p3b-cdp') -Port 9456 -ReadyMs 30000
-              if (Test-Path $cdpOut) {
-                $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue
-                if (($null -ne $cdom) -and ($cdom.Length -gt 0)) { $dom = $cdom; EmitDetail "P3b cdp dom bytes=$($dom.Length)" }
+              EmitDetail 'P3b dump-dom empty; extracting policy page over CDP (spec URL first, then chrome://policy/ which the binary registers)'
+              $cdpScript = Join-Path (Get-Location).Path 'probe/cdp-dump.ps1'
+              $appDir = $app
+              $tries = @(
+                @{ Url = 'browser://policy/'; Port = 9456; Ready = 10000 },
+                @{ Url = 'chrome://policy/'; Port = 9466; Ready = 30000 },
+                @{ Url = 'browser://policy'; Port = 9476; Ready = 10000 }
+              )
+              foreach ($t in $tries) {
+                $cdpOut = Join-Path $env:SPIKE "p3b-cdp-$($t.Port).html"
+                & $cdpScript -App $appDir -Url $t.Url -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE "profiles\p3b-cdp-$($t.Port)") -Port $t.Port -ReadyMs $t.Ready
+                $cdpExit = $LASTEXITCODE
+                $cdom = $null
+                if (Test-Path $cdpOut) { $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue }
+                if (($null -ne $cdom) -and ($cdom.Length -gt 500)) {
+                  $dom = $cdom
+                  EmitDetail "P3b cdp url=$($t.Url) dom bytes=$($dom.Length)"
+                  break
+                }
+                EmitDetail "P3b cdp url=$($t.Url) no dom (exit=$cdpExit)"
               }
               if ($dom.Length -le 500) { EmitDetail 'P3b cdp extraction produced no dom' }
             }
