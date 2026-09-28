@@ -350,7 +350,7 @@ jobs:
             if (($dom.Length -le 500) -and ($env:P0_CDP -eq 'ok')) {
               EmitDetail 'P3a dump-dom empty; extracting browser://policy over CDP instead'
               $cdpOut = Join-Path $env:SPIKE 'p3a-cdp.html'
-              & (Join-Path (Get-Location).Path 'probe/cdp-dump.ps1') -App $app -Url 'browser://policy/' -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE 'profiles\p3a-cdp') -Port 9455 -ReadyMs 30000
+              & (Join-Path (Get-Location).Path 'probe/cdp-dump.ps1') -App (Split-Path -Parent $exe) -Url 'browser://policy/' -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE 'profiles\p3a-cdp') -Port 9455 -ReadyMs 30000
               if (Test-Path $cdpOut) {
                 $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue
                 if (($null -ne $cdom) -and ($cdom.Length -gt 0)) { $dom = $cdom; EmitDetail "P3a cdp dom bytes=$($dom.Length)" }
@@ -716,9 +716,9 @@ jobs:
             if (Test-Path $out) { $dom = Get-Content $out -Raw -ErrorAction SilentlyContinue }
             if ($null -eq $dom) { $dom = '' }
             if (($dom.Length -le 500) -and ($env:P0_CDP -eq 'ok')) {
-              EmitDetail 'P4 dump-dom empty; extracting probe page over CDP (waits for the <pre id=o> result)'
+              EmitDetail 'P4 dump-dom empty; extracting probe page over CDP on the profile holding the downloaded CDM (waits for the <pre id=o> result)'
               $cdpOut = Join-Path $env:SPIKE 'p4-cdp.html'
-              & (Join-Path (Get-Location).Path 'probe/cdp-dump.ps1') -App $app -Url $uri -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE 'profiles\p4-cdp') -Port 9457 -ReadyMs 30000 -AwaitExpr '(function(){var p=document.getElementById("o");return p?p.innerText:""})()' -AwaitMs 120000
+              & (Join-Path (Get-Location).Path 'probe/cdp-dump.ps1') -App $app -Url $uri -OutFile $cdpOut -Base $base -Profile (Join-Path $env:SPIKE 'profiles\p4') -Port 9457 -ReadyMs 30000 -AwaitExpr '(function(){var p=document.getElementById("o");return p?p.innerText:""})()' -AwaitMs 120000
               if (Test-Path $cdpOut) {
                 $cdom = Get-Content $cdpOut -Raw -ErrorAction SilentlyContinue
                 if (($null -ne $cdom) -and ($cdom.Length -gt 0)) { $dom = $cdom; EmitDetail "P4 cdp dom bytes=$($dom.Length)" }

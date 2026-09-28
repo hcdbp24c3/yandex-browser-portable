@@ -31,43 +31,40 @@ try {
       -RedirectStandardOutput "$OutFile.out" -RedirectStandardError "$OutFile.err"
   }
 
-  $target = $null
-  $deadline = [DateTime]::UtcNow.AddMilliseconds($ReadyMs)
-  $lastErr = ''
-  while ([DateTime]::UtcNow -lt $deadline -and $null -eq $target) {
-    Start-Sleep -Milliseconds $PollMs
-    try {
-      $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/json/list" -UseBasicParsing -TimeoutSec 3
-      $list = @($r.Content | ConvertFrom-Json)
-      $pages = @($list | Where-Object { $_.type -eq 'page' })
-      if ($pages.Count -gt 0) {
-        $prefix = $Url.TrimEnd('/')
-        $exact = @($pages | Where-Object { $_.url -eq $Url -or $_.url -like ($prefix + '*') })
-        if ($exact.Count -gt 0) { $target = $exact[0] }
-        elseif ($pages.Count -eq 1) { $target = $pages[0]; Log "single page target accepted: $($pages[0].url)" }
-        else { Log "no url match yet; page count=$($pages.Count)" }
-      } else {
-        $lastErr = 'no page targets'
-      }
-    } catch {
-      $lastErr = $_.Exception.Message
+  function Find-Target {
+    $dl = [DateTime]::UtcNow.AddMilliseconds($ReadyMs)
+    $last = ''
+    while ([DateTime]::UtcNow -lt $dl) {
+      Start-Sleep -Milliseconds $PollMs
+      try {
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/json/list" -UseBasicParsing -TimeoutSec 3
+        $list = @($r.Content | ConvertFrom-Json)
+        $pages = @($list | Where-Object { $_.type -eq 'page' })
+        if ($pages.Count -gt 0) {
+          $prefix = $Url.TrimEnd('/')
+          $withUrl = @($pages | Where-Object { $_.url })
+          $exact = @($withUrl | Where-Object { $_.url -eq $Url -or $_.url -like ($prefix + '*') })
+          if ($exact.Count -gt 0) { Log "matched target url=$($exact[0].url)"; return $exact[0] }
+          if (($withUrl.Count -eq 1) -and ([DateTime]::UtcNow -gt $dl.AddMilliseconds(-4000))) {
+            Log "late single-page fallback url=$($withUrl[0].url)"
+            return $withUrl[0]
+          }
+          $last = "page urls=[$(($pages | ForEach-Object { $_.url }) -join ', ')]"
+        } else { $last = 'no page targets' }
+      } catch { $last = $_.Exception.Message }
     }
+    Log "no url-matched target within ${ReadyMs}ms (last=$last)"
+    return $null
   }
-  if ($null -eq $target) { Log "no debug target within ${ReadyMs}ms (last=$lastErr)"; exit 3 }
+  $target = Find-Target
+  if ($null -eq $target) { exit 3 }
   Log "target url=$($target.url)"
-
-  $ws = New-Object System.Net.WebSockets.ClientWebSocket
-  $ws.Options.KeepAliveInterval = [TimeSpan]::FromSeconds(5)
-  $ct = [Threading.CancellationToken]::None
-  $connTask = $ws.ConnectAsync([Uri]$target.webSocketDebuggerUrl, $ct)
-  if (-not $connTask.Wait(15000)) { throw 'ws connect timeout (15s)' }
-  Log 'ws connected'
-
 
   function Send-Json([string]$json) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($json)
     $seg = [ArraySegment[byte]]::new($bytes)
-    $ws.SendAsync($seg, [Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).GetAwaiter().GetResult() | Out-Null
+    $sendTask = $ws.SendAsync($seg, [Net.WebSockets.WebSocketMessageType]::Text, $true, $ct)
+    if (-not $sendTask.Wait(15000)) { throw 'ws send timeout (15s)' }
   }
   function Receive-Json {
     $ms = New-Object IO.MemoryStream
@@ -75,7 +72,7 @@ try {
     do {
       $seg = [ArraySegment[byte]]::new($buf)
       $recvTask = $ws.ReceiveAsync($seg, $ct)
-      if (-not $recvTask.Wait(10000)) { throw 'ws receive timeout (10s)' }
+      if (-not $recvTask.Wait(15000)) { throw 'ws receive timeout (15s)' }
       $res = $recvTask.Result
       if ($res.MessageType -eq [Net.WebSockets.WebSocketMessageType]::Close) { throw 'ws closed by peer' }
       $ms.Write($buf, 0, $res.Count)
@@ -96,6 +93,20 @@ try {
     throw "no CDP response for $method"
   }
   $script:cdpSeq = 0
+
+  $enabled = $false
+  for ($attempt = 1; ($attempt -le 2) -and (-not $enabled); $attempt++) {
+    if ($null -ne $ws) { try { $ws.Dispose() } catch { Log "ws dispose: $($_.Exception.Message)" }; $ws = $null }
+    $ws = New-Object System.Net.WebSockets.ClientWebSocket
+    $ws.Options.KeepAliveInterval = [TimeSpan]::FromSeconds(5)
+    $ct = [Threading.CancellationToken]::None
+    $connTask = $ws.ConnectAsync([Uri]$target.webSocketDebuggerUrl, $ct)
+    if (-not $connTask.Wait(15000)) { throw 'ws connect timeout (15s)' }
+    Log "ws connected (attempt $attempt)"
+    try { $null = Invoke-Cdp 'Runtime.enable' @{}; $enabled = $true }
+    catch { Log "Runtime.enable attempt ${attempt}: $($_.Exception.Message)"; if ($attempt -lt 2) { Start-Sleep -Seconds 3 } }
+  }
+  if (-not $enabled) { throw 'Runtime.enable failed after 2 attempts' }
 
   try { $null = Invoke-Cdp 'Runtime.enable' @{} } catch { Log "Runtime.enable: $($_.Exception.Message)" }
 
