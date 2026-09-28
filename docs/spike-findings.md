@@ -1,4 +1,4 @@
-# Spike findings — Yandex Browser portable (run 10, `36376731954`)
+# Spike findings — Yandex Browser portable (headless run 10, `36376731954`; headed P3 re-runs H1–H5)
 
 Workflow: `.github/workflows/spike.yml` (repo `hcdbp24c3/yandex-browser-portable`, branch `main`, commit `3117994`).
 Verdict lines scraped from run log (4 of 4):
@@ -76,4 +76,28 @@ P4 verdict: FAIL - eme=CDM_FAIL:NotSupportedError:Unsupported keySystem or suppo
 
 ---
 
-GO-NO-GO: NO-GO — P3 = IGNORED: the policy page (`browser://policy/`, `chrome://policy/`) never renders in headless CI across every channel (dump-dom kill at 45 s, empty Find-Target URLs, dead-renderer attach, CDP `Page.navigate` never committing), so policy honoring is unmeasurable; spec decision rules require stopping and reporting to the owner before Tasks 3–7. P1 extract PASS, P2 PASS (version.dll + ini portable dirs), P4 FAIL→WARN are individually acceptable, but P3 gates the design.
+---
+
+## Headed P3 re-run (operator decision A) — runs H1–H5, `mode=p3h`
+
+Headed re-run of the P3 gate on `windows-latest` (`--force-renderer-accessibility` added to the headed launch args). Procedure unchanged: baseline dump **before** `reg add` → `reg add HKLM\SOFTWARE\Policies\YandexBrowser YandexAliceMsgDisable=1 (REG_DWORD)` → policy dump → verdict → cleanup. `policy key existed before the test: False`; cleanup `test value removed=True; whole key removed=True`.
+
+| Run | ID | Outcome / defect found |
+|---|---|---|
+| H1 | 36382487294 | First `mode=p3h`: IGNORED — page never rendered (`domBytes=0`, window title `about:blank`, policy-cache hits=0) |
+| H2 | 36385320007 | `ERR_ABORTED` on `browser://policy`, devtools session lost across relaunch; baseline stage3 DID show window title `Policies — Yandex Browser`; `s3` relaunch timing races |
+| H3 | 36388486304 | **Root cause found**: every CDP command on the `chrome://policy` target returns `{"code":-32000,"message":"Forbidden"}` (Chromium WebUI inspection guard; target-based, not session-based — `about:blank` attach evaluates `1+1`→`value=2` fine). Verdict `IGNORED-never-rendered` was misleading: the page renders, CDP just cannot read it |
+| H4 | 36391370587 | 20-domain CDP scanner: **all 20 domains Forbidden**, except **`Page.printToPDF` → OK** (content channel; artifact saved). Windows UI Automation probe (`probe/uia-dump.ps1`) works: baseline extracted **2507 bytes** of the rendered page (key correctly absent pre-reg-add). Policy-phase UIA failed only because it ran AFTER the destructive stage-3 relaunch had replaced the window (empty title, frame text 297 B < 600 rejected) → verdict again misleading `IGNORED` |
+| H5 | 36392580458 | **HONORED** — UIA re-run both phases before the stage-3 relaunch. Baseline: window `Policies — Yandex Browser`, 4497 B, `YandexAliceMsgDisable present=False (expected False)`, cache hits=0. Policy: 2650 B (`via=uia`), key **present**: `YandexAliceMsgDisable ... true Platform Machine Mandatory` (DWORD `1` rendered as `true`, source `Platform`, level `Mandatory`), cache hits=0. `Page.printToPDF` artifacts corroborate: baseline 72 592 B vs policy 85 756 B PDF. `devtools /json/version = Chrome/150.0.7871.893`. Verdict line count = 1 |
+
+**Headed P3 verdict: HONORED — with `HKLM\SOFTWARE\Policies\YandexBrowser YandexAliceMsgDisable=1` set, headed Yandex Browser lists `YandexAliceMsgDisable` on `chrome://policy/` with source `Platform` and level `Mandatory`; baseline (pre-reg-add) correctly shows it absent.**
+
+Extraction chain that produced the evidence (all in `.github/workflows/spike.yml` `Invoke-HeadedDump` + `probe/cdp-dump.ps1`):
+
+1. CDP `Runtime.evaluate` outerHTML → `DOM.getOuterHTML` → `Page.captureSnapshot` (mhtml) → `Accessibility.getFullAXTree` — all Forbidden on WebUI targets.
+2. `Page.printToPDF` (the one allowed domain) → base64-decoded PDF artifact saved for the report (size delta baseline vs policy corroborates the extra row).
+3. Windows UI Automation walk (`probe/uia-dump.ps1`, run under `powershell.exe` 5.1 with `UIAutomationClient`): Name + ValuePattern text, accepted when ≥600 B, shown URL policy-gated (`Test-Usable`), marker `via=uia` recorded.
+
+**Why the earlier headless runs could not see this**: headless CI never committed navigation to `chrome://`/`browser://` (run 10, see P3 above), and headed CDP is blocked by the WebUI inspection guard — only `printToPDF` and UIA survive. The headless `IGNORED` was a measurement artifact, not a policy rejection.
+
+GO-NO-GO: GO — headed P3 HONORED, P1 PASS, P2 PASS, P4 degraded per plan
