@@ -851,7 +851,7 @@ jobs:
             $prof = Join-Path $env:SPIKE 'profiles\p3h'
             New-Item -ItemType Directory -Force -Path $prof | Out-Null
             $port = 9488
-            $headedBase = @('--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', '--disable-gpu', '--enable-logging=stderr', '--v=1')
+            $headedBase = @('--no-first-run', '--no-default-browser-check', '--disable-crash-reporter', '--disable-gpu', '--enable-logging=stderr', '--v=1', '--force-renderer-accessibility')
             $cdpScript = Join-Path (Get-Location).Path 'probe/cdp-dump.ps1'
 
             # launches a VISIBLE browser (no --headless anywhere) and extracts the
@@ -863,6 +863,8 @@ jobs:
               $script:P3hDom = ''
               $script:P3hUrl = ''
               $script:P3hNote = ''
+              $script:P3hWinTitle = ''
+              $script:P3hVia = ''
               function Launch-Headed([string]$launchUrl, [string]$suffix) {
                 $hout = Join-Path $env:SPIKE "p3h-$tag-headed$suffix-out.txt"
                 $herrL = Join-Path $env:SPIKE "p3h-$tag-headed$suffix-err.txt"
@@ -872,6 +874,8 @@ jobs:
                 $alive = (-not $bp.HasExited)
                 $wins = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { "pid=$($_.Id) title=[$($_.MainWindowTitle)]" })
                 EmitDetail "P3h $tag headed launch$suffix alive=$alive exit=$(if ($bp.HasExited) { $bp.ExitCode } else { 'running' }) windows=[$($wins -join ', ')]"
+                $pw = @($wins | Where-Object { $_ -match 'title=\[.*[Pp]olic' })
+                if ($pw.Count -gt 0) { $script:P3hWinTitle = ($pw -join ', ') }
                 if (-not $alive) { $script:P3hNote = "headed browser exited early code=$($bp.ExitCode)"; return $false }
                 $dt = ''
                 try {
@@ -981,10 +985,52 @@ jobs:
                   $best = Select-Best $candidates
                 }
               }
+              if ($null -eq $best) {
+                # refresh policy-window evidence (title updates only after navigation)
+                $wins = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { "pid=$($_.Id) title=[$($_.MainWindowTitle)]" })
+                $pw = @($wins | Where-Object { $_ -match 'title=\[.*[Pp]olic' })
+                if ($pw.Count -gt 0) { $script:P3hWinTitle = ($pw -join ', ') }
+                EmitDetail "P3h $tag policy window evidence=[$($script:P3hWinTitle)] - all CDP extraction failed; attempting UIA text read"
+                # CDP is Forbidden on WebUI targets; the rendered page is still readable
+                # through Windows UI Automation (browser launched with
+                # --force-renderer-accessibility so the renderer exposes its tree)
+                try {
+                  $uiaScript = Join-Path (Get-Location).Path 'probe/uia-dump.ps1'
+                  $uiaOut = Join-Path $env:SPIKE "p3h-$tag-uia.txt"
+                  $bpIds = @(Get-Process -Name browser -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+                  $psExe = Get-Command powershell.exe -ErrorAction SilentlyContinue
+                  if ($bpIds.Count -gt 0 -and $psExe -and (Test-Path $uiaScript)) {
+                    $uiaP = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden -Wait -ArgumentList @(
+                      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $uiaScript,
+                      '-ProcIds', ($bpIds -join ','), '-OutFile', $uiaOut)
+                    EmitDetail "P3h $tag uia-dump exit=$($uiaP.ExitCode)"
+                    if (Test-Path $uiaOut) {
+                      $ut = Get-Content $uiaOut -Raw -ErrorAction SilentlyContinue
+                      $ulen = 0; if ($null -ne $ut) { $ulen = $ut.Length }
+                      EmitDetail "P3h $tag uia text bytes=$ulen"
+                      if ($ulen -ge 600) {
+                        $actual = Get-PageUrls
+                        $shown = $null
+                        $pol = @(($actual -split ', ') | Where-Object { $_ -match 'policy' })
+                        if ($pol.Count -gt 0) { $shown = $pol[0] }
+                        elseif (-not $actual -or $actual -like 'error:*') { $shown = 'chrome://policy/' }
+                        if ($null -ne $shown -and (Test-Usable $shown $ut)) {
+                          $script:P3hNote = ''
+                          $script:P3hVia = 'uia'
+                          $best = @{ url = $shown; dom = $ut }
+                          EmitDetail "P3h $tag UIA candidate accepted (shown=$shown bytes=$ulen)"
+                        } else { EmitDetail "P3h $tag uia text rejected (shown=$shown)" }
+                      }
+                    }
+                  } else {
+                    EmitDetail "P3h $tag uia-dump skipped (pids=$($bpIds.Count) psExe=$([bool]$psExe) script=$(Test-Path $uiaScript))"
+                  }
+                } catch { EmitDetail "P3h $tag uia attempt failed: $($_.Exception.Message)" }
+              }
               Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
               Start-Sleep -Seconds 2
               if ($null -eq $best) {
-                if ($script:P3hNote -eq '') { $script:P3hNote = 'no policy page rendered after drive, re-attach and startup-url stages' }
+                if ($script:P3hNote -eq '') { $script:P3hNote = 'no policy page content after drive, re-attach, startup-url and UIA stages' }
                 return
               }
               $script:P3hDom = [string]$best.dom
@@ -1037,12 +1083,16 @@ jobs:
             $rendered = ($dom.Length -ge 200) -and (-not $looksError)
             EmitDetail "P3h rendered=$rendered (error-like page=$looksError)"
 
+            $via = ''
+            if ($script:P3hVia) { $via = "; via=$($script:P3hVia)" }
             if ($idx -ge 0) {
-              $v = "HONORED - headed $url lists YandexAliceMsgDisable with policy source (domBytes=$($dom.Length); evidence: $ev)"
+              $v = "HONORED - headed $url lists YandexAliceMsgDisable with policy source (domBytes=$($dom.Length)$via; evidence: $ev)"
             } elseif ($cacheHits.Count -gt 0) {
               $v = "HONORED - headed browser ingested the HKLM test key into its policy cache (domBytes=$($dom.Length); cache: $($cacheHits[0]))"
             } elseif ($rendered) {
-              $v = "IGNORED - headed $url rendered (domBytes=$($dom.Length)) but YandexAliceMsgDisable is absent and no policy cache entry exists"
+              $v = "IGNORED - headed $url rendered (domBytes=$($dom.Length)$via) but YandexAliceMsgDisable is absent and no policy cache entry exists"
+            } elseif ($script:P3hWinTitle) {
+              $v = "UNMEASURABLE - headed window rendered the policy page ($($script:P3hWinTitle)) but content extraction failed: every CDP domain on the WebUI target returns Forbidden and UIA produced no usable text (note=$($script:P3hNote)); policy honoring undetermined"
             } else {
               $v = "IGNORED - headed policy page never rendered (url=$url; domBytes=$($dom.Length); note=$($script:P3hNote)) and no policy cache entry exists"
             }

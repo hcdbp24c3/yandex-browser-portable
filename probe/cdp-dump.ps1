@@ -285,7 +285,57 @@ try {
       else { Log "captureSnapshot no-data response: $(J $snap)" }
     } catch { Log "captureSnapshot: $($_.Exception.Message)" }
   }
-  if (-not $html) { throw 'no DOM: outerHTML, DOM.getOuterHTML and Page.captureSnapshot all produced nothing' }
+  if (-not $html) {
+    # accessibility tree is a different domain - may survive where Runtime/DOM/Page are Forbidden
+    Log 'falling back to Accessibility.getFullAXTree'
+    try {
+      $ae = Invoke-Cdp 'Accessibility.enable' @{}
+      if ($ae.PSObject.Properties['error']) { Log "Accessibility.enable RPC error: $(J $ae.error)" }
+      $ax = Invoke-Cdp 'Accessibility.getFullAXTree' @{}
+      if ($ax.PSObject.Properties['error']) { Log "Accessibility.getFullAXTree RPC error: $(J $ax.error)" }
+      elseif ($null -ne $ax.result -and $ax.result.nodes) {
+        $parts = New-Object System.Collections.Generic.List[string]
+        foreach ($nd in @($ax.result.nodes)) {
+          foreach ($f in 'name', 'value', 'description') {
+            if ($nd.PSObject.Properties[$f] -and $nd.$f -and $nd.$f.PSObject.Properties['value'] -and $nd.$f.value) {
+              [void]$parts.Add([string]$nd.$f.value)
+            }
+          }
+          if ($nd.PSObject.Properties['properties'] -and $nd.properties) {
+            foreach ($pr in @($nd.properties)) {
+              if ($pr.value -and $pr.value.PSObject.Properties['value'] -and $pr.value.value) {
+                [void]$parts.Add([string]$pr.value.value)
+              }
+            }
+          }
+        }
+        $html = ($parts -join ' | ')
+        Log "AX tree nodes=$(@($ax.result.nodes).Count) text bytes=$($html.Length)"
+      }
+      else { Log "Accessibility.getFullAXTree no-nodes response: $(J $ax)" }
+    } catch { Log "Accessibility.getFullAXTree: $($_.Exception.Message)" }
+  }
+  if (-not $html) {
+    # map which domains this target allows at all (evidence for the spike report)
+    Log 'scanning CDP domain availability on this target'
+    foreach ($m in @('Log.enable', 'Network.enable', 'Debugger.enable', 'Profiler.enable', 'CSS.enable',
+                     'DOMStorage.enable', 'Application.enable', 'CacheStorage.enable', 'ServiceWorker.enable',
+                     'IndexedDB.enable', 'Audits.enable', 'Emulation.enable', 'Overlay.enable', 'Storage.enable',
+                     'Media.enable', 'DeviceAccess.enable', 'PWA.enable', 'Fetch.enable', 'Security.enable',
+                     'Inspector.enable')) {
+      try {
+        $pr = Invoke-Cdp $m @{}
+        if ($pr.PSObject.Properties['error']) { Log "domain-scan $m -> error: $($pr.error.message)" }
+        else { Log "domain-scan $m -> OK" }
+      } catch { Log "domain-scan $m -> exception: $($_.Exception.Message)" }
+    }
+    try {
+      $pdf = Invoke-Cdp 'Page.printToPDF' @{ printBackground = $true }
+      if ($pdf.PSObject.Properties['error']) { Log "domain-scan Page.printToPDF -> error: $($pdf.error.message)" }
+      else { Log "domain-scan Page.printToPDF -> OK bytes=$(@($pdf.result.data).Length)" }
+    } catch { Log "domain-scan Page.printToPDF -> exception: $($_.Exception.Message)" }
+  }
+  if (-not $html) { throw 'no DOM: outerHTML, DOM.getOuterHTML, Page.captureSnapshot and Accessibility tree all produced nothing' }
   Set-Content -Path $OutFile -Value $html -Encoding utf8
   Log "dom bytes=$($html.Length)"
   $ok = $true
