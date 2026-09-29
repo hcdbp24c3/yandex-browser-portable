@@ -33,6 +33,7 @@ P4 verdict: FAIL - eme=CDM_FAIL:NotSupportedError:Unsupported keySystem or suppo
 ## P3 — Policy honoring (gate)
 
 - **Verdict: IGNORED** (emitted): `YandexAliceMsgDisable absent from browser://policy after reg add (dump bytes=0)`.
+  > **Superseded** by the headed H5 result (see the H1–H5 section below): gate = **GO** (headless IGNORED was a measurement artifact).
 - Procedure order preserved: baseline **before** reg add → `P3a baseline dom bytes=0; present=False (expected False)` → `reg add HKLM\SOFTWARE\Policies\YandexBrowser YandexAliceMsgDisable=1 (REG_DWORD)` (`policy key existed before the test: False`) → dump → `key not present in the browser://policy dump` → cleanup `test value removed=True; whole key removed=True`.
 - **Enum evidence**: `YandexAutoLaunchMode absent from the dump (browser://policy only lists registered keys)`; `ADMX has no YandexAutoLaunchMode entry`. Also runtime stderr: `[CORP] YandexAntiTracking. Status: This policy is disabled.` / `Cloud management controller initialization aborted as CBCM is not enabled.` — policy infrastructure initializes but is inert headless.
 - **Why IGNORED, not HONORED — measurement is unverifiable in headless CI.** Across all channels, the policy page never renders:
