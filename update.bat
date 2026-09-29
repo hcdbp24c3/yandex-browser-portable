@@ -6,7 +6,7 @@ echo.
 set "APP_DIR=%~dp0"
 set "APP_DIR=%APP_DIR:~0,-1%"
 set "PS1=%TEMP%\yandex_update.ps1"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:APP_DIR='%APP_DIR%'; (Get-Content '%~f0' | Select-Object -Skip 11) | Out-File -Encoding utf8 '%PS1%'; & '%PS1%'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:PSModulePath = $PSHOME + '\Modules;' + $env:PSModulePath; $env:APP_DIR='%APP_DIR%'; (Get-Content '%~f0' | Select-Object -Skip 11) | Out-File -Encoding utf8 '%PS1%'; & '%PS1%'"
 set "RC=%ERRORLEVEL%" & del "%PS1%" 2>nul
 exit /b %RC%
 # ---------------------------------------------------------------------------
@@ -18,6 +18,28 @@ exit /b %RC%
 # Files the update must never overwrite (Helium #5 protectedPaths lesson);
 # version.txt is rewritten by this flow itself after a successful update.
 $protectedPaths = @('chrome++.ini', 'update.bat', 'debloater.reg', 'version.txt')
+
+# When update.bat is spawned from pwsh (smoke CI), powershell.exe 5.1 inherits
+# pwsh's PSModulePath (Core paths first) and cannot auto-load Utility commands
+# such as Get-FileHash (PowerShell issue #8635). The batch header prepends
+# $PSHOME\Modules, and this .NET fallback keeps hashing working regardless.
+if (-not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+    function Get-FileHash {
+        param(
+            [Parameter(Mandatory = $true)][string]$LiteralPath,
+            [string]$Algorithm = 'SHA256'
+        )
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $fs = [IO.File]::OpenRead($LiteralPath)
+        try {
+            [pscustomobject]@{ Hash = [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-', '') }
+        }
+        finally {
+            $fs.Dispose()
+            $sha.Dispose()
+        }
+    }
+}
 
 function Read-UpdatePrompt([string]$Message) {
     # Single Read-Host wrapper: CI pipes `echo y| update.bat` (Helium pattern).
@@ -266,6 +288,7 @@ try {
 }
 catch {
     Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "  PSModulePath: $env:PSModulePath" -ForegroundColor Red
     $rc = 1
 }
 if ($outcome -ne 'Declined') {

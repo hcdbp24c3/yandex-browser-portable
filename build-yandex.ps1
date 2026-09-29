@@ -287,7 +287,13 @@ try {
     }
 
     foreach ($f in 'chrome++.ini', 'debloater.reg', 'update.bat') {
-        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) -Destination $yandexDir -Force
+        # Shipped packages carry these inside Yandex\ already (and the update
+        # flow treats them as protected), so a missing source here is expected
+        # when rebuilding from an extracted package - not an error.
+        $src = Join-Path $PSScriptRoot $f
+        if (Test-Path -LiteralPath $src) {
+            Copy-Item -LiteralPath $src -Destination $yandexDir -Force
+        }
     }
 
     # update.bat invokes $APP_DIR\..\build-yandex.ps1 - ship this script at the
