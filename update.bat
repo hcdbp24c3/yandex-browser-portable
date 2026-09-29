@@ -28,7 +28,9 @@ function Get-LatestPackageVersion {
     # winget-pkgs PackageVersion dirs are the same source of truth
     # build-yandex.ps1 trusts for tag/zip/version.txt (design section 3).
     $listUrl = 'https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/y/Yandex/Browser'
-    $entries = Invoke-RestMethod -Uri $listUrl -Headers @{ 'User-Agent' = 'yandex-browser-portable-updater' }
+    $hdrs = @{ 'User-Agent' = 'yandex-browser-portable-updater' }
+    if ($env:GITHUB_TOKEN) { $hdrs['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
+    $entries = Invoke-RestMethod -Uri $listUrl -Headers $hdrs
     $versions = @($entries | Where-Object { $_.type -eq 'dir' } | ForEach-Object {
         $v = $null
         if ([version]::TryParse($_.name, [ref]$v)) { [pscustomobject]@{ Name = $_.name; Version = $v } }
