@@ -97,7 +97,8 @@ func (l *windowsLock) Close() error {
 }
 
 // Listen serves one message at a time on the forwarding pipe until stop is
-// called. stop closes the handle, which unblocks the serving goroutine.
+// called. stop cancels the pending connect and closes the handle from a
+// background goroutine, so it always returns promptly.
 func (l *windowsLock) Listen(name string, onURL func(string)) (func() error, error) {
 	path, err := windows.UTF16PtrFromString(pipePath(name))
 	if err != nil {
@@ -112,40 +113,58 @@ func (l *windowsLock) Listen(name string, onURL func(string)) (func() error, err
 	if err != nil {
 		return nil, fmt.Errorf("create forward pipe: %w", err)
 	}
+
+	stopCh := make(chan struct{})
+	served := make(chan struct{})
+	var once sync.Once
+
 	l.mu.Lock()
 	l.pipeHandle = handle
 	l.mu.Unlock()
 
-	stopCh := make(chan struct{})
-	var once sync.Once
+	// CloseHandle does not return while a synchronous ConnectNamedPipe is still
+	// pending on the handle, so the cancel has to be issued first and the close
+	// has to run off the caller's goroutine. Holding l.mu across either call
+	// deadlocks every other method on this lock, and blocking here would stop
+	// Run's deferred stop() from ever returning - a --dry-run selftest that
+	// never connects to the pipe would then hang instead of printing its
+	// verdict (CI run 36784045139).
 	stop := func() error {
 		once.Do(func() {
 			close(stopCh)
 			l.mu.Lock()
-			if l.pipeHandle != 0 {
-				_ = windows.CloseHandle(l.pipeHandle)
-				l.pipeHandle = 0
-			}
+			h := l.pipeHandle
+			l.pipeHandle = 0
 			l.mu.Unlock()
+			if h != 0 {
+				go func() {
+					_ = windows.CancelIoEx(h, nil)
+					<-served
+					_ = windows.CloseHandle(h)
+				}()
+			}
 		})
 		return nil
 	}
 
 	go func() {
+		defer close(served)
 		for {
-			err := windows.ConnectNamedPipe(handle, nil)
-			if err != nil &&
-				!errors.Is(err, windows.ERROR_PIPE_CONNECTED) &&
-				!errors.Is(err, windows.ERROR_NO_DATA) {
-				return // stop() closed the handle, or the pipe broke
-			}
-			if url := readPipeLine(handle); url != "" {
-				onURL(url)
-			}
+			// Check before connecting: a client that connects between two
+			// messages must not leave the next ConnectNamedPipe pending.
 			select {
 			case <-stopCh:
 				return
 			default:
+			}
+			err := windows.ConnectNamedPipe(handle, nil)
+			if err != nil &&
+				!errors.Is(err, windows.ERROR_PIPE_CONNECTED) &&
+				!errors.Is(err, windows.ERROR_NO_DATA) {
+				return // stop() cancelled the pipe, or it broke
+			}
+			if url := readPipeLine(handle); url != "" {
+				onURL(url)
 			}
 		}
 	}()
