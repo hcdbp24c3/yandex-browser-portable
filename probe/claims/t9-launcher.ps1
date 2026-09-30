@@ -81,6 +81,11 @@ function Invoke-Launcher {
         -NoNewWindow -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
     if (-not $p.WaitForExit($TimeoutSec * 1000)) {
         try { $p.Kill() } catch { }
+        # Dump whatever the launcher managed to print: a bare timeout says
+        # nothing about which stage hung.
+        Show-Output -Label ("{0} (timed out)" -f $Label) -Text (Read-OutputFile -File $outFile)
+        $errOnTimeout = Read-OutputFile -File $errFile
+        if ($errOnTimeout.Trim() -ne '') { Show-Output -Label ("{0} stderr (timed out)" -f $Label) -Text $errOnTimeout }
         throw ("launcher '{0}' did not exit within {1}s" -f $Label, $TimeoutSec)
     }
     $text = Read-OutputFile -File $outFile
