@@ -1,9 +1,8 @@
 # Issue #1 claims — empirical findings (feature `yandex-issue1-claims-test`)
 
-**Status: RUN COMPLETE (Task 1, T1–T8)** — every `T<n> verdict:` line for T1–T8
-below is copied verbatim from the successful `claims.yml` run log (run
-36664258871, 2026-09-30). T9 (Go launcher, Task 2) is wired into the same
-workflow and its section below is filled from its own run.
+**Status: RUN COMPLETE (Tasks 1–2)** — every `T<n> verdict:` line below is
+copied verbatim from a successful `claims.yml` run log (T1–T8 from run
+36664258871, T9 from run 36785388609).
 The §1–§8 verdict column and the Corrections/Owner-decisions sections stay
 `PENDING` until Task 3 aggregates T1–T9 into issue verdicts.
 
@@ -35,7 +34,7 @@ The §1–§8 verdict column and the Corrections/Owner-decisions sections stay
 | §5 Non-admin HKCU policies | HKCU\Software\Policies honored | PENDING | T1, T2 |
 | §6 Deep profile preseed | preseeded `Preferences`/`Local State` keys exist | PENDING | T5, T6 |
 | §7 Automated profile & cache maintenance | cache/crashpad pruning is safe | PENDING | T7 |
-| §8 Native Go launcher, bilingual | mutex + HKCU lifecycle + prune (MVP mechanics) | PENDING | T9 (Task 2) |
+| §8 Native Go launcher, bilingual | mutex + HKCU lifecycle + prune (MVP mechanics) | PENDING | T9 (Task 2, run 36785388609) |
 
 Verdict vocabulary for the final table (Task 3): `CONFIRMED` / `PARTIALLY-TRUE` /
 `REFUTED` / `SCOPE-REJECTED`.
@@ -58,6 +57,12 @@ T6 verdict: PASS - atomic .tmp+File.Replace accepted: probe key read back after 
 T7 verdict: PASS - rule: relaunch ok + >=1 dir recreated + no missing GPUCache/Default\Cache (event-driven dirs reported only); relaunch=ok; recreated=ShaderCache,GrShaderCache,Default\Cache,Default\Code Cache,Crashpad; missing=none; event-driven=none; critical-missing=none
 T8 verdict: PASS - rendered with lang=ru (negotiation is profile/OS-level; en-US-only pak trim keeps the render); domBytes=722 (source=reused T3-E tree; Locales=[en-US.pak])
 T1 verdict: IGNORED - YandexAliceMsgDisable, Telemetry absent from chrome://policy after HKCU reg add (via=uia bytes=10269)
+```
+
+T9 (run 36785388609, `test=t9`):
+
+```
+T9 verdict: PASS - mode=skip(IGNORED); policy skipped (T1 IGNORED), HKCU untouched; version.dll preferred, explicit fallback flags when it is set aside; mutex+start-twice forward, prune stale+fresh, EN/RU settings, selftest exit 0
 ```
 
 All lines above are byte-identical to the run log (the T3 group-E line alone
@@ -191,7 +196,10 @@ comes from profile/OS, unaffected by pak trimming.
 
 ## T9 — Native Go launcher MVP (issue §4/§7/§8)
 
-**Verdict: PENDING** — filled from the T9 CI run once it completes.
+**Verdict: PASS** (run 36785388609) — `mode=skip(IGNORED); policy skipped
+(T1 IGNORED), HKCU untouched; version.dll preferred, explicit fallback flags
+when it is set aside; mutex+start-twice forward, prune stale+fresh, EN/RU
+settings, selftest exit 0`.
 
 Scope: MVP **mechanics only** — single-instance mutex, the ephemeral HKCU
 policy lifecycle, the portable launch plan, the T7 cache prune and EN/RU
@@ -210,30 +218,59 @@ line-anchored regex so the evidence table cannot match it):
 | anything else (`IGNORED`, `FAIL`, …) | `skip - <exact T1 line>` | nothing is written to HKCU at all |
 | file or `T1 verdict:` line missing | — | selftest fails: Task 1 incomplete |
 
-With the T1 verdict currently on record (`IGNORED`, run 36664258871), the T9
-run exercises the **skip** path: the exact T1 reason is logged and HKCU is
-proven untouched before/during/after. The apply path stays covered by Go unit
-tests over an in-memory `RegistryView` seam (apply → verify → cleanup,
-pre-existing value restored, foreign values untouched, rollback on mid-apply
-failure) — it is not exercised on the runner because T1 has not earned it.
+With the T1 verdict on record (`IGNORED`, run 36664258871) the run exercises
+the **skip** path. Verbatim from the log:
 
-### What the T9 driver proves on the runner
+```
+detail: T9: T1 verdict=IGNORED -> launcher mode=skip(IGNORED)
+detail: T9: [selftest-dll] mode: skip - T1 verdict: IGNORED - YandexAliceMsgDisable, Telemetry absent from chrome://policy after HKCU reg add (via=uia bytes=10269)
+```
 
-`probe/claims/t9-launcher.ps1`, against a real extracted package:
+HKCU stayed untouched: the driver snapshots
+`HKCU\Software\Policies\YandexBrowser` before the first run and after the last
+and asserts every one of the 11 names has the same presence and the same
+value in both (`detail: T9: HKCU left untouched in skip mode`). The apply
+path is not exercised on the runner because T1 has not earned it; it stays
+covered by Go unit tests over an in-memory `RegistryView` seam — apply →
+verify → cleanup, pre-existing value restored, foreign values untouched, and
+rollback on a mid-apply failure.
 
-1. `go vet ./...` + `go test ./...` + `go build` (T9 Go checks step).
-2. Mutex acquired as `Global\YandexPortable_SingleInstance`; a second
-   invocation while the first is held forwards its argv URL over the named
-   pipe and both exit 0. A mutex create error is fatal — there is no `Local\`
-   fallback, because a fallback would fake the claim under test.
-3. Launch plan matches what is on disk: `version.dll` preferred, explicit
-   `--user-data-dir`/`--disk-cache-dir` fallback asserted after the DLL is set
-   aside.
-4. Prune: a stale `state.json` (9 days) deletes the T7 volatile dirs under
-   `Data\` and re-stamps `state.json`; the immediate rerun takes the fast-skip
-   path.
-5. Bilingual `--settings` output (EN and RU) without touching the mutex or the
-   registry.
+### What the run proved (verbatim stage lines)
+
+| Claim (issue §) | Evidence from run 36785388609 |
+|---|---|
+| §8 single instance | `mutex: acquired Global\YandexPortable_SingleInstance`; start-twice: `mutex: held by another instance` → `forward: url delivered to the running instance (https://example.test/from-second)` → primary logged `selftest: hold received url https://example.test/from-second`. Both invocations exited 0. |
+| §4 portable launch | `launch: version.dll next to browser.exe - portable Data/Cache redirection`. With the DLL set aside: `launch: version.dll missing - fallback flags: --user-data-dir …\Data --disk-cache-dir …\Cache`. The package did ship `version.dll` this run, so the DLL-present plan is the real one. |
+| §7 cache prune | `prune: state.json age 216h0m0s >= 168h0m0s - executing` → `prune: executed - removed 1 dir(s): GPUCache` → `prune: state.json written`. The immediate rerun took the fast path: `prune: state.json age 0s < 168h0m0s - fast skip`. |
+| §8 bilingual | `--settings --lang en` → `language: en` / `hkcu-mode: skip - T1 verdict: …`; `--lang ru` → `настройки:` / `язык: ru` / `hkcu-режим: …`. Neither touched the mutex or the registry. |
+| §8 selftest | every launcher invocation printed `selftest: ok - all checks passed` and exited 0. |
+
+The prune list in `launcher/prune.go` is exactly T7's delete list
+(`GPUCache`, `ShaderCache`, `GrShaderCache`, `DawnCache`, `Default/Cache`,
+`Default/Code Cache`, `Default/Service Worker/CacheStorage`, `Crashpad`, plus
+`BrowserMetrics*`), and the driver independently asserts `debloater.reg`
+yields exactly 11 dwords and that none of the 3-don't-touch names
+(`SafeBrowsingProtectionLevel`, `ComponentUpdatesEnabled`) reaches the
+launcher.
+
+### Defect this task found and fixed (launcher-only)
+
+Run 36783446605 emitted `T9 verdict: FAIL - launcher 'selftest-dll' did not
+exit within 60s` — the first `--dry-run` selftest never returned and printed
+nothing. `lock_windows_test.go` (build-tagged `windows`) reproduced it on the
+runner and the stack dump named the cause: `stop()` called
+`windows.CloseHandle` on the pipe handle while the serving goroutine sat in a
+**synchronous** `ConnectNamedPipe` on that same handle (`0x1dc` in both
+frames). `CloseHandle` does not return until the pending I/O finishes, and
+because the call was made while holding `l.mu` it deadlocked every other
+method on that lock too — so `Run`'s deferred `stop()` never returned and the
+process never reached `os.Exit`. That is exactly the shape of the claim under
+test: a `--dry-run` selftest that never connects to the pipe could never shut
+down. Fixed by releasing `l.mu` before touching the handle and issuing
+`CancelIoEx` + `CloseHandle` from a background goroutine (`CancelIoEx`, not
+`CancelIo`: it cancels the connect issued by the serving goroutine's thread).
+`go test ./...` on `windows-latest` went from a 10-minute panic timeout to
+1.6 s.
 
 ---
 
@@ -252,6 +289,15 @@ Source run for every row: [claims run 36664258871](https://github.com/hcdbp24c3/
 | T6 | 36664258871 | `T6 verdict: PASS - atomic .tmp+File.Replace accepted: ...` |
 | T7 | 36664258871 | `T7 verdict: PASS - rule: relaunch ok + ...` |
 | T8 | 36664258871 | `T8 verdict: PASS - rendered with lang=ru ...; domBytes=722 ...` |
+| T9 | 36785388609 | `T9 verdict: PASS - mode=skip(IGNORED); policy skipped (T1 IGNORED), HKCU untouched; version.dll preferred, explicit fallback flags when it is set aside; mutex+start-twice forward, prune stale+fresh, EN/RU settings, selftest exit 0` |
+
+T9 launcher runs (its own dispatch input `test=t9`, same workflow):
+
+| Run | Result | Note |
+|---|---|---|
+| 36783446605 | `T9 verdict: FAIL` | launcher-only defect: the pipe listener could not be shut down, so the first `--dry-run` selftest hung (60 s) and printed nothing |
+| 36784045139 | `T9 verdict: FAIL` | the RED run for `lock_windows_test.go`; the Windows-only test reproduced the hang and its stack dump identified the `CloseHandle`/`ConnectNamedPipe` deadlock |
+| 36785388609 | `T9 verdict: PASS` | after the cancellable-shutdown fix; `go test ./...` on the runner 1.6 s (was a 10 m panic timeout) |
 
 Probe-development runs (probe defects found and fixed test-first, same workflow):
 36661822112 (T6 `File.Replace($null)` binding crash, T8 `lang=ru` misjudged as
