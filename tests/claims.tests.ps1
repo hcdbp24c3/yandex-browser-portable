@@ -279,6 +279,59 @@ Assert ($fiRunLog -match 'SHA256 verified') 'fetch-installer reports the SHA256 
 Remove-Item -LiteralPath $fiRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ''
+Write-Host 'Invoke-AtomicReplace (T6 File.Replace $null-binding regression)'
+# PS method binding converts $null to an empty string for [string] parameters,
+# so [IO.File]::Replace($src, $dst, $null) throws "The path is empty" - the CI
+# T6 probe died on its first write. The helper must swap without that binding.
+$arDir = Join-Path ([IO.Path]::GetTempPath()) ('atomic-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $arDir -Force | Out-Null
+$arDst = Join-Path $arDir 'dest.txt'
+$arSrc = Join-Path $arDir 'src.txt'
+Set-Content -LiteralPath $arDst -Value 'old' -NoNewline
+Set-Content -LiteralPath $arSrc -Value 'new' -NoNewline
+$arErr = ''
+$arOk = $false
+try {
+    $null = Invoke-AtomicReplace -SourcePath $arSrc -DestinationPath $arDst
+    $arOk = $true
+}
+catch {
+    $arErr = $_.Exception.Message
+}
+Assert ($arOk) "Invoke-AtomicReplace swaps without the empty-path binding error (err=$arErr)"
+$arDstText = if (Test-Path -LiteralPath $arDst) { [string](Get-Content -LiteralPath $arDst -Raw) } else { '' }
+Assert ($arDstText -eq 'new') 'destination carries the new content after the replace'
+Assert (-not (Test-Path -LiteralPath $arSrc)) 'source is gone after the replace'
+$arMissing = $false
+try { Invoke-AtomicReplace -SourcePath (Join-Path $arDir 'nope.txt') -DestinationPath $arDst | Out-Null }
+catch { $arMissing = $true }
+Assert ($arMissing) 'a missing source throws instead of silently no-oping'
+Remove-Item -LiteralPath $arDir -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Host ''
+Write-Host 'Get-LocaleVerdict (T8 negotiated-language expectation)'
+# navigator.language comes from profile/OS negotiation, not from the pak
+# catalog - CI showed lang=ru on an en-US-only Locales tree while the page
+# rendered fine. The verdict must judge the render, not the language tag.
+$lvRender = $null
+try { $lvRender = Get-LocaleVerdict -DomOk $true -Lang 'ru' -OnlyEn $true -DomBytes 722 }
+catch { $lvRender = '(command missing)' }
+Assert ($lvRender -match '^PASS') "render ok + en-US-only tree passes for any negotiated language (got: $lvRender)"
+$lvNoMarker = $null
+try { $lvNoMarker = Get-LocaleVerdict -DomOk $false -Lang 'en-US' -OnlyEn $true -DomBytes 0 }
+catch { $lvNoMarker = '(command missing)' }
+Assert ($lvNoMarker -match '^FAIL') "missing render marker fails (got: $lvNoMarker)"
+$lvNoLang = $null
+try { $lvNoLang = Get-LocaleVerdict -DomOk $true -Lang '' -OnlyEn $true -DomBytes 722 }
+catch { $lvNoLang = '(command missing)' }
+Assert ($lvNoLang -match '^FAIL') "unreadable navigator.language fails (got: $lvNoLang)"
+$lvDirtyTree = $null
+try { $lvDirtyTree = Get-LocaleVerdict -DomOk $true -Lang 'ru' -OnlyEn $false -DomBytes 722 }
+catch { $lvDirtyTree = '(command missing)' }
+Assert ($lvDirtyTree -match '^FAIL') "a tree with extra locale paks fails the only-en-US precondition (got: $lvDirtyTree)"
+Assert (($lvRender -match 'lang=ru') -or ($lvRender -match 'ru')) 'the passing verdict reports the observed language tag'
+
+Write-Host ''
 Write-Host "RESULT: $script:passed passed, $script:failed failed"
 if ($script:failed -gt 0) {
     foreach ($f in $script:failure) { Write-Host "  - $f" -ForegroundColor Red }

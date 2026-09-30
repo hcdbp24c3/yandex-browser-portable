@@ -381,3 +381,52 @@ function Get-VerdictIdsForSelection {
 
     return ,$all
 }
+
+# ------------------------------------------------------- T6 atomic replace --
+
+function Invoke-AtomicReplace {
+    <# Atomic same-directory swap: the caller writes $SourcePath (a .tmp), then
+       the destination is replaced in place. Never passes $null as the backup
+       argument - PowerShell binds $null to an empty [string] for .NET method
+       parameters, and File.Replace then throws "The path is empty" (the CI T6
+       probe died on exactly that on its first write). #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$DestinationPath
+    )
+
+    if (-not (Test-Path -LiteralPath $SourcePath)) { throw "atomic replace source missing: $SourcePath" }
+    [IO.File]::Replace($SourcePath, $DestinationPath, [NullString]::Value)
+    return $true
+}
+
+# -------------------------------------------------------- T8 locale verdict --
+
+function Get-LocaleVerdict {
+    <# T8 verdict: judge the RENDER after the locale trim, not the language
+       tag. navigator.language comes from profile/OS negotiation (CI run showed
+       lang=ru on an en-US-only Locales tree with a fully rendered page) - the
+       pak catalog holds UI strings and does not drive the negotiation, so the
+       verdict reports the observed tag instead of demanding en*. #>
+    [CmdletBinding()]
+    param(
+        [bool]$DomOk,
+        [bool]$OnlyEn,
+        [AllowNull()][AllowEmptyString()][string]$Lang = '',
+        [int]$DomBytes = 0
+    )
+
+    $problems = @()
+    if (-not $DomOk) { $problems += 'body render marker RENDERED_TEXT_OK missing' }
+    if ([string]::IsNullOrWhiteSpace($Lang)) {
+        $problems += 'navigator.language unreadable (no LOCALE_ title in DOM)'
+    }
+    elseif ($DomBytes -le 0) {
+        $problems += 'empty page dump (domBytes=0)'
+    }
+    if (-not $OnlyEn) { $problems += 'Locales tree is not en-US.pak-only (trim precondition broken)' }
+    if ($problems.Count -gt 0) { return ('FAIL - ' + ($problems -join '; ')) }
+
+    return ('PASS - rendered with lang={0} (negotiation is profile/OS-level; en-US-only pak trim keeps the render); domBytes={1}' -f $Lang, $DomBytes)
+}

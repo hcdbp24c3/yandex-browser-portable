@@ -44,7 +44,7 @@ try {
     $tmp = $pref + '.tmp'
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($tmp, $new, $utf8NoBom)
-    [IO.File]::Replace($tmp, $pref, $null)
+    Invoke-AtomicReplace -SourcePath $tmp -DestinationPath $pref
     $tmpGone = -not (Test-Path -LiteralPath $tmp)
     $mid = Get-Content -LiteralPath $pref -Raw
     $midOk = ($mid -match ('"{0}"\s*:\s*"{1}"' -f $probeKey, $probeVal))
