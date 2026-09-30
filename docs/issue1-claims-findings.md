@@ -298,6 +298,14 @@ T9 launcher runs (its own dispatch input `test=t9`, same workflow):
 | 36783446605 | `T9 verdict: FAIL` | launcher-only defect: the pipe listener could not be shut down, so the first `--dry-run` selftest hung (60 s) and printed nothing |
 | 36784045139 | `T9 verdict: FAIL` | the RED run for `lock_windows_test.go`; the Windows-only test reproduced the hang and its stack dump identified the `CloseHandle`/`ConnectNamedPipe` deadlock |
 | 36785388609 | `T9 verdict: PASS` | after the cancellable-shutdown fix; `go test ./...` on the runner 1.6 s (was a 10 m panic timeout) |
+| 36785952624 | `T9 verdict: PASS` | full `test=all` re-run (the workflow's default selection, now T1–T9): `success` in 10m5s, `all 9 selected probe(s) emitted verdict lines (14 lines total)`, and the T1–T8 lines came out unchanged — T9 running before T1 contaminated nothing |
+
+Two notes on the `test=all` re-run. T1's `bytes=` figure moved
+(10269 → 11670) because it is the `chrome://policy` UIA dump size, which depends
+on the live policy page content; the verdict token itself is unchanged
+(`IGNORED - YandexAliceMsgDisable, Telemetry absent from chrome://policy after
+HKCU reg add`). And T9's stage order is the only ordering-relevant change:
+it snapshots HKCU, so it runs after T8 but still before T1.
 
 Probe-development runs (probe defects found and fixed test-first, same workflow):
 36661822112 (T6 `File.Replace($null)` binding crash, T8 `lang=ru` misjudged as
