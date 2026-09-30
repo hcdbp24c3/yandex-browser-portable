@@ -332,6 +332,31 @@ Assert ($lvDirtyTree -match '^FAIL') "a tree with extra locale paks fails the on
 Assert (($lvRender -match 'lang=ru') -or ($lvRender -match 'ru')) 'the passing verdict reports the observed language tag'
 
 Write-Host ''
+Write-Host 'Get-PrefsLeftovers (T6 leftover scope regression)'
+# The browser's own SQLite sidecars (History-journal, Web Data-journal, ...)
+# live in the same folder as Preferences and are NORMAL after a launch - only
+# files derived from the Preferences NAME itself are corruption leftovers
+# (CI run 1 flagged every sqlite journal and produced a false FAIL).
+$plNames = @('Preferences', 'Preferences.tmp', 'History-journal', 'Web Data-journal', 'Cookies')
+$plGot = $null
+try { $plGot = Get-PrefsLeftovers -Names $plNames }
+catch { $plGot = '(command missing)' }
+$plList = @($plGot)
+Assert ($plList.Count -eq 1 -and $plList[0] -eq 'Preferences.tmp') "only Preferences-derived junk counts (got: $($plList -join ','))"
+$plClean = $null
+try { $plClean = Get-PrefsLeftovers -Names @('Preferences', 'History-journal', 'Web Data-journal', 'Ya Credit Cards-journal') }
+catch { $plClean = '(command missing)' }
+Assert (@($plClean).Count -eq 0) "browser sqlite journals are not corruption leftovers (got: $((@($plClean)) -join ','))"
+$plMore = $null
+try { $plMore = Get-PrefsLeftovers -Names @('Preferences.bak', 'Preferences-journal', 'Preferences') }
+catch { $plMore = '(command missing)' }
+Assert (@($plMore).Count -eq 2) "Preferences.bak and Preferences-journal are leftovers (got: $((@($plMore)) -join ','))"
+$plEmpty = $null
+try { $plEmpty = Get-PrefsLeftovers -Names @() }
+catch { $plEmpty = '(command missing)' }
+Assert (@($plEmpty).Count -eq 0) "an empty name list yields no leftovers"
+
+Write-Host ''
 Write-Host "RESULT: $script:passed passed, $script:failed failed"
 if ($script:failed -gt 0) {
     foreach ($f in $script:failure) { Write-Host "  - $f" -ForegroundColor Red }

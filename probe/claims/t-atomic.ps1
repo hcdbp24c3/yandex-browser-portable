@@ -64,10 +64,9 @@ try {
     try { $null = $after | ConvertFrom-Json } catch { $jsonOk = $false }
     $readBack = ($after -match ('"{0}"\s*:\s*"{1}"' -f $probeKey, $probeVal))
     $dir = Split-Path -Parent $pref
-    $siblings = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like 'Preferences*' } | ForEach-Object { $_.Name })
-    $tmpLeftovers = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '\.(tmp|bak|journal)$' -or $_.Name -like '*-journal' } | ForEach-Object { $_.Name })
+    $allNames = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $siblings = @($allNames | Where-Object { $_ -like 'Preferences*' })
+    $tmpLeftovers = Get-PrefsLeftovers -Names $allNames
 
     $problems = @()
     if ($launchCode -ne 0) { $problems += "launch exit=$launchCode (dom bytes=$($dom.Length))" }

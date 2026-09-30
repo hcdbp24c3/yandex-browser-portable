@@ -430,3 +430,23 @@ function Get-LocaleVerdict {
 
     return ('PASS - rendered with lang={0} (negotiation is profile/OS-level; en-US-only pak trim keeps the render); domBytes={1}' -f $Lang, $DomBytes)
 }
+
+# ---------------------------------------------------- T6 prefs leftovers --
+
+function Get-PrefsLeftovers {
+    <# Corruption leftovers from an atomic Preferences write: only files whose
+       name is derived from "Preferences" itself (Preferences.tmp/.bak/-journal).
+       The browser's own SQLite sidecars (History-journal, Web Data-journal,
+       ...) live in the same Default\ folder and are NORMAL after any launch -
+       flagging them turned CI run 1's T6 into a false FAIL. #>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$Names = @())
+
+    $leftovers = @()
+    foreach ($n in $Names) {
+        if ([string]::IsNullOrWhiteSpace($n)) { continue }
+        if ($n -ieq 'Preferences') { continue }
+        if ($n -like 'Preferences*' -and $n -match '(\.(tmp|bak|journal)$|-journal$)') { $leftovers += $n }
+    }
+    return ,$leftovers
+}
