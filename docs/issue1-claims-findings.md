@@ -1,10 +1,12 @@
 # Issue #1 claims — empirical findings (feature `yandex-issue1-claims-test`)
 
-**Status: RUN COMPLETE (Tasks 1–2)** — every `T<n> verdict:` line below is
-copied verbatim from a successful `claims.yml` run log (T1–T8 from run
-36664258871, T9 from run 36785388609).
-The §1–§8 verdict column and the Corrections/Owner-decisions sections stay
-`PENDING` until Task 3 aggregates T1–T9 into issue verdicts.
+**Status: RUN COMPLETE + AGGREGATED (Tasks 1–3)** — every `T<n> verdict:` line
+below is copied verbatim from a successful `claims.yml` run log (T1–T8 from run
+36664258871, T9 from run 36785388609). Task 3 aggregated T1–T9 into the §1–§8
+verdicts below; the evidence is unchanged, only the interpretation is added.
+The Owner-decisions section is an explicit **PENDING** block: no adoption is
+implemented here, and nothing below is a claim about the issue being
+"disproven" — sub-claims that no probe could settle are marked `UNTESTED`.
 
 - Repo: `hcdbp24c3/yandex-browser-portable`, branch `main`
 - Workflow: `.github/workflows/claims.yml`, dispatch input `test=all` (T1–T9)
@@ -25,19 +27,104 @@ The §1–§8 verdict column and the Corrections/Owner-decisions sections stay
 
 ## Verdict table (issue sections §1–§8)
 
+Verdict vocabulary: `CONFIRMED` (directly observed by a probe),
+`PARTIALLY-TRUE` (the actionable part holds or partly holds, a named sub-claim
+does not), `REFUTED` (a named sub-claim is contradicted by measurement),
+`SCOPE-REJECTED` (a real engineering request, deliberately declined — no verdict
+from evidence), `UNTESTED` (no probe could settle it; never silently scored).
+
 | Issue section | Claim (short) | Verdict | Probes |
 |---|---|---|---|
-| §1 Global multi-language support | bilingual (EN/RU) everywhere | PENDING | T8 |
-| §2 Upstream base → Corporate/Enterprise | switch to Corporate edition | PENDING | T4 |
-| §3 Radical payload trimming (~26 files) | strip to 26 essential files | PENDING | T3 |
-| §4 Portable DLL redirection (`version.dll`) | side-by-side DLL relocates Data/Cache | PENDING | spike P2 (prior evidence) |
-| §5 Non-admin HKCU policies | HKCU\Software\Policies honored | PENDING | T1, T2 |
-| §6 Deep profile preseed | preseeded `Preferences`/`Local State` keys exist | PENDING | T5, T6 |
-| §7 Automated profile & cache maintenance | cache/crashpad pruning is safe | PENDING | T7 |
-| §8 Native Go launcher, bilingual | mutex + HKCU lifecycle + prune (MVP mechanics) | PENDING | T9 (Task 2, run 36785388609) |
+| §1 Global multi-language support | bilingual (EN/RU) everywhere | PARTIALLY-TRUE | T8, T3 (group E) |
+| §2 Upstream base → Corporate/Enterprise | switch to Corporate edition | PARTIALLY-TRUE | T4, T3 (group A) |
+| §3 Radical payload trimming (~26 files) | strip to 26 essential files | PARTIALLY-TRUE | T3 |
+| §4 Portable DLL redirection (`version.dll`) | side-by-side DLL relocates Data/Cache | CONFIRMED | T9, spike P2 |
+| §5 Non-admin HKCU policies | HKCU\Software\Policies honored | PARTIALLY-TRUE | T1, T2, T9 |
+| §6 Deep profile preseed | preseeded `Preferences`/`Local State` keys exist | PARTIALLY-TRUE | T5, T6 |
+| §7 Automated profile & cache maintenance | cache/crashpad pruning is safe | CONFIRMED | T7, T9 |
+| §8 Native Go launcher, bilingual | mutex + HKCU lifecycle + prune (MVP mechanics) | PARTIALLY-TRUE | T9 |
 
-Verdict vocabulary for the final table (Task 3): `CONFIRMED` / `PARTIALLY-TRUE` /
-`REFUTED` / `SCOPE-REJECTED`.
+Summary: **2 CONFIRMED (§4, §7), 6 PARTIALLY-TRUE, 0 fully REFUTED sections.**
+No section is wholly refuted because no section's *goal* is unachievable; what
+is refuted are specific named sub-claims, which the breakdown below attributes
+individually. The heaviest corrections are in §3 (`widgets\` is not safe to
+delete) and §5 (5 of the 9 cited policy names do not exist).
+
+## Per-section line-by-line breakdown
+
+### §1 Global multi-language support — PARTIALLY-TRUE
+
+| Line | Verdict | Evidence |
+|---|---|---|
+| "`browser.dll`, `resources.pak` carries full international multi-language support" | **CONFIRMED** | T8 rendered a complete page on a tree holding **only** `Locales=[en-US.pak]`: `domBytes=722`, body marker present. The engine is not tied to one language. |
+| "`Locales\` contains all standard global language packs" | PARTIALLY-TRUE | T3 group E deleted **63** paks covering 16 locales (`cs de en-US es fr it ja kk pt-BR pt-PT ru tr uk uz zh-CN zh-TW`) = the entire shipped set of 64 files (63 + the kept `en-US.pak`). 16 locales ship, not the "en-US, en-GB, Spanish, German, …" list — **there is no `en-GB.pak` in 26.8.4.893** (REFUTED for the `en-GB.pak` example). |
+| "let the builder select the preferred language in `Locales\`" | PARTIALLY-TRUE | Selecting the paks is safe and is what removes 8,826,180 B of bloat, but it does **not** select the UI language: T8 negotiated `lang=ru` from the profile/OS with no `accept_languages` preseed. Pak choice is a *necessary and sufficient for rendering*, not sufficient for language. The real levers are `accept_languages` in the profile or the ADMX `ApplicationLocaleValue` policy. |
+
+### §2 Corporate / Enterprise upstream — PARTIALLY-TRUE
+
+| Line | Verdict | Evidence |
+|---|---|---|
+| "Switch the CI download target to Corporate Edition" | **REFUTED as actionable** | T4: only the ADMX template is public — `PUBLIC-ENDPOINT https://download.cdn.yandex.net/browser/corporate/YandexBrowser.admx (HTTP 200)`. The MSI/exe candidates and the support landing page returned 404. Combined with prior research (the Corporate MSI is login-gated), the switch cannot be made from an unauthenticated CI job. |
+| "It completely eliminates consumer affiliate bundles" | CONFIRMED — but by trimming, not by switching | T3 group A deleted `clidmgr.exe`, `browser_proxy.exe`, `clids_yandex.xml`, `clids_yandex_second.xml` from the **consumer** tree with zero capability loss (`broken=()`, dump/webgl/eme all OK) and saved 2,872,078 B. The goal is reachable without the Corporate package. |
+| "It honors all Chromium/Yandex Group Policies natively without pushback" | UNTESTED | No probe switched editions, so this cannot be scored. Not counted against the section. |
+
+### §3 Radical payload trimming to ~26 files — PARTIALLY-TRUE
+
+| Line | Verdict | Evidence |
+|---|---|---|
+| "`widgets\` (Flutter components) — safe to eliminate" | **REFUTED** | T3 group B: `broken=(Dump,Webgl,Eme)`, `dump OK->BROKEN; webgl OK->BROKEN; eme NO_RESULT (baseline OK)`. Deleting `widgets\` breaks three capabilities, including Widevine EME. This is the single most damaging error in the issue. |
+| "`voiceactivation\`, `web_app_config\` — safe to eliminate" | CONFIRMED | T3 groups C and D: `SAFE`, `broken=()`, 1,427,748 B + 934,475 B, dump/webgl/eme unchanged. |
+| "`clidmgr.exe`, `browser_proxy.exe`, `clids_*.xml` — safe to eliminate" | CONFIRMED | T3 group A: `SAFE`, `broken=()`, 2,872,078 B. |
+| "Unused language paks — keep desired locales" | CONFIRMED | T3 group E `SAFE` (8,826,180 B) + T8 `PASS` on the trimmed tree. |
+| "Down to just ~26 essential files without breaking WebGL, GPU or Widevine" | PARTIALLY-TRUE | The five measured groups are A/C/D/E safe and B unsafe. Provably-safe trimming = **14,060,481 B = 14.06 MB = 2.73 %** of the 515,092,109 B baseline. Including B would reach 28,997,457 B (5.63 %) but only by breaking capabilities. The proposed ~26-file manifest was **not** validated as a working set, so "26 files" remains unproven. |
+| "retains nearly ~482 MB of unneeded bloat" | PARTIALLY-TRUE | Measured baseline for 26.8.4.893 is **515,092,109 B = 491.2 MiB = 515.1 MB** (T3 `baselineBytes`). The order of magnitude is right; the figure is ~7 % low. Measured *unneeded* bloat is 14–29 MB, not 482 MB. |
+
+### §4 Portable DLL redirection (`version.dll`) — CONFIRMED
+
+| Line | Verdict | Evidence |
+|---|---|---|
+| "`version.dll` side-loading relocates `%LocalAppData%` targets to `.\Data` / `.\Cache`" | CONFIRMED | T9: `launch: version.dll next to browser.exe - portable Data/Cache redirection`, and the package did ship `version.dll` that run, so the DLL-present plan is the real one. Prior spike P2. |
+| "support multiple loaders with automatic fallback to launch arguments if side-loading is blocked" | CONFIRMED | T9 with the DLL set aside: `launch: version.dll missing - fallback flags: --user-data-dir …\Data --disk-cache-dir …\Cache`. Implemented in `launcher` as a preferred-plan-then-explicit-fallback decision, not a silent one. |
+| "~1.88 ns per hook", "Shadow Stack / CET / ACG resilience" | UNTESTED | Never measured, and not our code — they describe the third-party loader's internals. Left unscored rather than repeated as fact. |
+
+### §5 Non-admin HKCU policies — PARTIALLY-TRUE
+
+| Line | Verdict | Evidence |
+|---|---|---|
+| "`debloater.reg` targets HKLM, requires elevation, fails on non-admin accounts" | CONFIRMED | `debloater.reg` ships `HKEY_LOCAL_MACHINE\SOFTWARE\Policies\YandexBrowser`. |
+| "`HKEY_CURRENT_USER\Software\Policies\YandexBrowser`" is the real key | CONFIRMED | T2: all **461** ADMX policies carry `key="Software\Policies\YandexBrowser"` and `class="Both"`, so a user-scope write is structurally valid, and writing HKCU needs no elevation. |
+| "Writing to HKCU works 100 % without administrator privileges … policies honored" | PARTIALLY-TRUE | The *no-elevation* half is CONFIRMED. The *honored* half was **not observed**: T1 `reg add`-ed `YandexAliceMsgDisable=1` and `Telemetry=1` and neither name appeared in `chrome://policy` (`via=uia bytes=10269`) → `IGNORED`. T1 cannot say why (asynchronous refresh, or the page lists a subset), so this is reported as not-observed rather than as a proof that HKCU is ignored. |
+| 5 of the 9 cited policy names exist | **REFUTED** | T2: `MetricsReportingEnabled`, `YandexAliceEnabled`, `FeedbackAllowed`, `PromotionalTabsEnabled`, `BrowserAddPersonEnabled` are **fabricated** — absent from the ADMX. See Appendix A. |
+| "expand the policy set from 11 to 40–50+ enterprise flags" | PARTIALLY-TRUE | The 11 shipped names are all real (**11/11** present) and the catalog is far larger than 50 (**461**), so the ceiling claim is fine; the 9 recommended names are the problem — 5 of them would be no-ops if applied. |
+| "zero-trace: policies applied ephemerally on startup and cleaned up on exit" | CONFIRMED (mechanics) | T9 implements the lifecycle in `launcher`, and the CI run proves the **skip** path leaves HKCU byte-for-byte untouched (`HKCU left untouched in skip mode`, all 11 names unchanged) because T1 is `IGNORED`. The apply path stays covered by Go unit tests over a `RegistryView` seam, not by the runner. |
+
+### §6 Deep profile preseed — PARTIALLY-TRUE
+
+| Line | Verdict | Evidence |
+|---|---|---|
+| "seed `neuro_question.video_button_enabled = false`" | **REFUTED as written** | T5: `neuro_question=ABSENT, video_button_enabled=ABSENT` — neither key exists in a fresh first run, before or after the launch, and **0** keys materialized on their own. The named JSON path is not where this setting lives. The real policy-level levers are the ADMX `NeuroQuestionEnabled` and `YandexVideoSummarization`. |
+| "if left unseeded, the browser generates default promo feeds and neural buttons on first launch" | **REFUTED** | T5: `6 EXIST (0 materialized, 4 preseeded, 0 lost, 2 absent)`. Nothing materialized itself. |
+| "`show_ya_button`, `app_side_promo_service_enabled`, `alissenger`, `default_apps_installed`" | CONFIRMED | T5: all 4 `PRESEEDED` — written by our preseed and surviving the first run; `0 lost`. |
+| "always write profile JSON via `.tmp` + atomic replacement" | CONFIRMED | T6 `PASS`: probe key written via `.tmp` + `File.Replace` read back after relaunch, JSON valid, no `Preferences`-derived leftovers. |
+
+### §7 Automated profile & cache maintenance — CONFIRMED
+
+| Line | Verdict | Evidence |
+|---|---|---|
+| "prune `GPUCache`, `ShaderCache`, `GrShaderCache`, `DawnCache`, `Default\Cache`, `Default\Code Cache`, `Default\Service Worker\CacheStorage`, `Crashpad`, `*BrowserMetrics*`" | CONFIRMED | T7 `PASS`: all deleted, relaunch OK, `recreated=ShaderCache,GrShaderCache,Default\Cache,Default\Code Cache,Crashpad`, `missing=none`, `critical-missing=none`. |
+| "`DawnGraphiteCache`" | UNTESTED | The only path in §7's list that neither T7's delete set nor `launcher/prune.go` contains; it was not observed in the 26.8.4.893 profile, so there was nothing to prune. Not claimed as unnecessary. |
+| "store the last clean timestamp in `state.json` and skip disk scans" | CONFIRMED | T9: `prune: state.json age 216h0m0s >= 168h0m0s - executing` → `prune: executed - removed 1 dir(s): GPUCache` → `prune: state.json written`; the immediate rerun took `age 0s < 168h0m0s - fast skip`. The implemented list in `launcher/prune.go` is exactly T7's list. |
+
+### §8 Native Go launcher — PARTIALLY-TRUE (mechanics CONFIRMED, GUI SCOPE-REJECTED)
+
+| Line | Verdict | Evidence |
+|---|---|---|
+| "single-instance mutex `Global\YandexPortable_SingleInstance`, forwards URLs" | CONFIRMED | T9: `mutex: acquired Global\YandexPortable_SingleInstance`; start-twice → `mutex: held by another instance` → `forward: url delivered to the running instance (https://example.test/from-second)` → primary logged the received URL. Both invocations exited 0. |
+| "ephemeral HKCU policy lifecycle" | CONFIRMED (mechanics) | Wired and tested; the CI run exercises the `skip` branch because T1 is `IGNORED`, and the driver proves HKCU is untouched. |
+| "bilingual EN/RU settings" | CONFIRMED | T9: `--lang en` → `language: en` / `hkcu-mode: skip - T1 verdict: …`; `--lang ru` → `настройки:` / `язык: ru` / `hkcu-режим: …`. Neither touched the mutex or the registry. |
+| "optional GUI settings window: Fluent Dark window, rounded cards, toggles" | SCOPE-REJECTED | Deliberately not built — a GUI framework is a product decision for the suite, and the MVP's headless `--settings` output is the tested surface. No evidence either way; it is a scope call, not a finding. |
+| "edition selector (Corporate/Standard/Gamer/Beta)" | SCOPE-REJECTED + moot | No scope for an MVP, and §2's Corporate option is login-gated (T4) so the selector could not offer a working Corporate entry. |
+| "Non-admin Desktop Shortcut generation" | UNTESTED | Not implemented in the MVP, so no probe could settle it. |
 
 ## Verdict lines (verbatim from the run log)
 
@@ -311,10 +398,155 @@ Probe-development runs (probe defects found and fixed test-first, same workflow)
 36661822112 (T6 `File.Replace($null)` binding crash, T8 `lang=ru` misjudged as
 FAIL), 36663223628 (T6 sqlite-journal false positive).
 
+## Appendix A — ADMX audit (the §5 policy catalog)
+
+Source: `https://download.cdn.yandex.net/browser/corporate/YandexBrowser.admx`,
+563,480 bytes, UTF-16LE. **461 `<policy>` elements, 461 unique names, all
+`class="Both"`**, all with `key="Software\Policies\YandexBrowser"`. `class="Both"`
+means Machine **and** User scope, which is why an HKCU write is structurally
+valid — but only T1 could have proven runtime honouring, and T1 came back
+`IGNORED`. Re-fetched locally for this appendix and re-derived from the file,
+independently of T2's CI run; both agree.
+
+### The 9 names cited in issue §5
+
+| # | Issue-named key | In ADMX? | Real counterpart in the ADMX |
+|---|---|---|---|
+| 1 | `MetricsReportingEnabled` | **fabricated** | `StatisticsReporting`, `Telemetry`, `TelemetrySelective` |
+| 2 | `YandexAliceEnabled` | **fabricated** | `YandexAliceMsgDisable` (the only Alice policy; already shipped) |
+| 3 | `FeedbackAllowed` | **fabricated** | `YandexUserFeedbackMode`, `YandexUserFeedbackPath` |
+| 4 | `SpellCheckServiceEnabled` | present | — |
+| 5 | `AutofillCreditCardEnabled` | present | — |
+| 6 | `AutofillAddressEnabled` | present | — |
+| 7 | `PromotionalTabsEnabled` | **fabricated** | no `PromotionalTabs*` exists; nearest real: `NtpAdsDisabled`, `NtpContentDisabled` |
+| 8 | `DefaultSearchProviderEnabled` | present | — |
+| 9 | `BrowserAddPersonEnabled` | **fabricated** | no `*AddPerson*` / `*Person*` policy exists; nearest real: `ForceEphemeralProfiles`, `RoamingProfileLocation`, `RoamingProfileSupportEnabled` |
+
+**5 fabricated, 4 present.** Applying the 9 as written would leave 5 no-ops.
+
+### The 11 names already shipped in `debloater.reg`
+
+All **11/11** are real and present: `StatisticsReporting`, `CrashesReporting`,
+`BackgroundModeEnabled`, `YandexAutoLaunchMode`, `YandexAliceMsgDisable`,
+`NeuroNtpTools`, `NtpNotificationsDisable`, `YandexButtonDisable`,
+`SearchSuggestEnabled`, `UpdateAllowed`, `BackgroundUpdateAllowed`.
+
+### Extra levers the issue did not mention
+
+Relevant to §6's rejected `neuro_question` JSON path: `NeuroQuestionEnabled`,
+`YandexVideoSummarization`, `YandexSummarizationDisable`,
+`YandexDisableBackgroundVideos`. Relevant to §1's language question:
+`ApplicationLocaleValue`. The catalog also contains 46 `*_recommended`
+companions that carry recommended-state metadata rather than an enforcement
+value.
+
 ## Corrections to issue #1 (probe-backed)
 
-PENDING (Task 3 aggregates after T1–T9).
+1. **§5 — Corporate Edition is login-gated, so the CI download cannot simply
+   "switch".** Only the ADMX template is public (`T4 verdict: PUBLIC-ENDPOINT
+   … (HTTP 200)`); the MSI/exe candidates and the support landing page returned
+   404, and the Corporate MSI is login-gated per prior research. The *goal* —
+   no consumer affiliate bundles — is already reachable from the consumer tree:
+   T3 group A deleted `clidmgr.exe`, `browser_proxy.exe` and `clids_*.xml` with
+   `broken=()`.
+2. **§5 — 5 of the 9 cited policy names do not exist.** `MetricsReportingEnabled`,
+   `YandexAliceEnabled`, `FeedbackAllowed`, `PromotionalTabsEnabled`,
+   `BrowserAddPersonEnabled` are absent from the 461-policy ADMX. Real
+   counterparts in Appendix A.
+3. **§5 — the catalog is 461 policies, not 40–50.** All 461 are `class="Both"`,
+   all under `Software\Policies\YandexBrowser`. The 11 shipped names are valid
+   (11/11), so the shipped `debloater.reg` is sound; it is the *recommendation*
+   to expand to those specific 9 that needs correcting.
+4. **§5 — "HKCU is honored at runtime" was not observed.** T1 wrote two real
+   policy names (`YandexAliceMsgDisable`, `Telemetry`) and neither appeared in
+   `chrome://policy` (`T1 verdict: IGNORED`, `via=uia bytes=10269`). Reported as
+   not-observed, not as proof of non-honouring: the probe cannot distinguish
+   "ignored" from "not refreshed yet" or "page lists a subset".
+5. **§3 — `widgets\` is NOT safe to eliminate.** The issue's table lists it under
+   "Safe to Eliminate"; T3 group B measured `broken=(Dump,Webgl,Eme)` and
+   `eme NO_RESULT (baseline OK)` after deleting it. It must stay in the payload.
+6. **§3 — the bloat is 14–29 MB, not 482 MB, and "26 files" is unproven.** Measured
+   baseline 515,092,109 B (491.2 MiB). Provably-safe trim A+C+D+E = 14,060,481 B
+   (14.06 MB, **2.73 %**); A–E including the unsafe B = 28,997,457 B (5.63 %).
+   The proposed ~26-file manifest was never validated as a working set.
+7. **§1 — there is no `en-GB.pak` in 26.8.4.893**, and pak selection does not
+   select the UI language. The shipped `Locales\` held 64 files across 16
+   locales; T8 rendered fine with only `en-US.pak` but negotiated `lang=ru`
+   from the profile/OS. Use `accept_languages` or the `ApplicationLocaleValue`
+   policy to control language.
+8. **§6 — the named preseed path does not exist and nothing self-materializes.**
+   T5: `neuro_question=ABSENT`, `video_button_enabled=ABSENT`, `0 materialized,
+   4 preseeded, 0 lost`. The issue's premise that the browser "generates default
+   promo feeds and neural buttons on first launch" is contradicted. The 4 keys we
+   do seed are PRESEEDED and survive. Atomic `.tmp` + `File.Replace` writing is
+   CONFIRMED (T6 `PASS`).
+9. **§4 / §7 — the two engineering asks that were made are confirmed.**
+   `version.dll` relocation works with an explicit
+   `--user-data-dir`/`--disk-cache-dir` fallback when the DLL is blocked, and
+   the T7 prune list plus the `state.json` 168 h fast-skip are implemented and
+   proven. `DawnGraphiteCache` (in §7's list) is the one path neither T7 nor the
+   launcher covers — untested, not disproven.
+10. **§8 — the MVP mechanics are confirmed; the GUI is out of scope.** Mutex +
+    URL forward, ephemeral HKCU lifecycle, bilingual EN/RU, prune and selftest
+    all PASS. A Fluent-Dark GUI, an edition selector and shortcut generation were
+    not built — a scope decision, not a finding.
+
+### What we may adopt (pending owner — see Owner decisions)
+
+- **Moot:** HKCU dual-root in `debloater.reg` (recommendation (a)) — T1 is
+  `IGNORED`, so there is no evidence-backed case for it today.
+- Candidate, proven safe: trim groups **A / C / D / E** into `build-yandex.ps1`
+  (14.06 MB, 2.73 %) — recommendation (b).
+- Already shipped and proven: the 4 preseeded `Preferences` keys (T5), the
+  `version.dll`-preferred launch plan with fallback (T9), and the T7 cache prune
+  with `state.json` fast-skip (T7/T9).
+
+### Declined
+
+- **Blind 26-file shipping trim** — `widgets\` breaks Dump/WebGL/EME and the full
+  manifest was never validated (§3).
+- **Corporate edition switch** — login-gated, and its goal is met by trim (T4, T3-A).
+- **Full Go GUI** — MVP mechanics only, pending owner approval (§8).
+
+### Reported on issue #1
+
+The evidence-first comment with this summary, the run links and the per-section
+verdicts is posted:
+
+**https://github.com/hcdbp24c3/yandex-browser-portable/issues/1#issuecomment-5921077842**
 
 ## Owner decisions
 
-PENDING (Task 3 asks and records; adoptions are implemented in a follow-up feature).
+**PENDING — awaiting the repository owner.** No adoption is implemented in this
+task; the three questions below are open. Each will be recorded here
+(accepted / declined, with rationale) by a follow-up edit once answered, and any
+accepted item gets its own follow-up feature (plan Non-Goals: adoption is split
+out of the testing feature).
+
+**Question (a) — HKCU dual-root in `debloater.reg`.** Should `debloater.reg`
+gain a `HKEY_CURRENT_USER\Software\Policies\YandexBrowser` root alongside the
+existing `HKEY_LOCAL_MACHINE\SOFTWARE\Policies\YandexBrowser` root (write both,
+non-admin fallback)?
+*Status:* **MOOT unless a future probe re-checks.** T1 came back `IGNORED` — the
+two real policy names written to HKCU never appeared in `chrome://policy` — so
+today there is no evidence that a HKCU root is honoured at runtime. The launcher
+already implements the full ephemeral HKCU lifecycle behind this gate: it reads
+the `T1 verdict:` line from this file and writes nothing at all while that
+verdict is anything other than `HONORED`.
+
+**Question (b) — proven-safe trim groups.** Should `build-yandex.ps1` adopt the
+proven-safe trim groups **A / C / D / E** (`clidmgr.exe`, `browser_proxy.exe`,
+`clids_*.xml`; `voiceactivation\`; `web_app_config\`; `Locales\` reduced to
+`en-US.pak`) for 14.06 MB (2.73 % of the payload), with group **B**
+(`widgets\`) explicitly retained because it breaks Dump/WebGL/EME?
+*Status:* **OPEN.** Measured SAFE by T3, but T3 measures safety only — adoption is
+an owner decision.
+
+**Question (c) — ship the launcher in the release zip.** Should the compiled
+`launcher.exe` be added to the `.github/workflows/build.yml` release zip?
+*Status:* **OPEN.** The launcher is deliberately **not** in the zip today. Shipping
+it also means the end user runs a binary that can write `HKCU\Software\Policies`,
+so it should be an explicit owner call, not a side effect of packaging.
+
+*Answers are not yet recorded.* Until they are, nothing in this document claims
+owner approval for any adoption.
