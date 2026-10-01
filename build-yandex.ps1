@@ -3,6 +3,7 @@ param(
     [switch]$Download,
     [string]$Version,
     [string]$OutDir,
+    [switch]$KeepVendorBloat,
     [string]$ChromePlusUrl = 'https://github.com/bibicadotnet/Chromium_SetDLL/releases/download/1.18.2/Chrome.2B.2B_v1.18.2_x86_x64_arm64.7z'
 )
 
@@ -33,7 +34,9 @@ param(
                            browser.exe - Chrome registers the preinstalled CDM only
                            from the exe-dir flat path), place Chrome++ version.dll
                            next to browser.exe with a launch.bat --user-data-dir
-                           fallback (spike P2/P2b), then write layout-manifest.txt.
+                           fallback (spike P2/P2b), trim the vendor groups A/C/D/E
+                           that T3 measured SAFE (step 3b; -KeepVendorBloat opts
+                           out), then write layout-manifest.txt.
       4. Debloat         - profile preseed: copy preseed/Local State ->
                            Data\Local State, preseed/Preferences ->
                            Data\Default\Preferences, empty "First Run" sentinel
@@ -142,6 +145,97 @@ function Find-NestedBrowserArchive([string]$dir) {
         Select-Object -First 1
     if ($hit) { return $hit.FullName }
     return $null
+}
+
+function Get-TrimTargetBytes([string]$path) {
+    # Byte total of one trim target (file or whole directory) for the
+    # bytes-saved accounting. Absent/unreadable targets contribute 0.
+    if (-not (Test-Path -LiteralPath $path)) { return [int64]0 }
+    $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return [int64]0 }
+    if (-not $item.PSIsContainer) { return [int64]$item.Length }
+    [int64]$total = 0
+    Get-ChildItem -LiteralPath $path -Recurse -File -ErrorAction SilentlyContinue |
+        ForEach-Object { $total = $total + [int64]$_.Length }
+    return $total
+}
+
+function Remove-TrimGroup([string]$Root, [string]$Name, [string]$Filter, [switch]$Directory, [switch]$RootOnly) {
+    # Removes one target pattern of a T3 trim group and returns the bytes removed.
+    # A = root-level clidmgr.exe / browser_proxy.exe / clids_*.xml, exactly the set
+    # T3 deleted; C/D = the voiceactivation\ and web_app_config\ directories.
+    # C/D discovery is RECURSIVE on purpose: T3 measured the VERSIONED
+    # Yandex\<ver>\voiceactivation and Yandex\<ver>\web_app_config, so a
+    # root-only lookup would report 'absent' and save 0 bytes on a real tree.
+    # Group A stays root-only so the trimmed set is never wider than the set T3
+    # actually proved SAFE. An absent target is logged and is never fatal - a
+    # consumer build may legitimately not ship it. A locked target is logged and
+    # skipped (the build must not die on a running vendor helper).
+    $targets = @()
+    if ($RootOnly) {
+        if ($Directory) {
+            $targets = @(Get-ChildItem -LiteralPath $Root -Directory -Filter $Filter -ErrorAction SilentlyContinue)
+        }
+        else {
+            $targets = @(Get-ChildItem -LiteralPath $Root -File -Filter $Filter -ErrorAction SilentlyContinue)
+        }
+    }
+    elseif ($Directory) {
+        $targets = @(Get-ChildItem -LiteralPath $Root -Recurse -Directory -Filter $Filter -ErrorAction SilentlyContinue)
+    }
+    else {
+        $targets = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter $Filter -ErrorAction SilentlyContinue)
+    }
+    if ($targets.Count -eq 0) {
+        Write-Host "trim: $Name absent $Filter"
+        return [int64]0
+    }
+    [int64]$saved = 0
+    foreach ($t in $targets) {
+        $bytes = Get-TrimTargetBytes $t.FullName
+        Remove-Item -LiteralPath $t.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $t.FullName) {
+            Write-Host "trim: $Name FAILED $($t.FullName) (still present after delete)"
+            continue
+        }
+        $saved = $saved + $bytes
+        Write-Host "trim: $Name removed $($t.FullName)"
+    }
+    return $saved
+}
+
+function Remove-TrimLocalePaks([string]$Root) {
+    # Group E: inside every recursively located Locales\ directory keep
+    # en-US.pak and remove the other *.pak files. Non-pak files in Locales\ are
+    # deliberately KEPT - T8 measured UI-locale negotiation as profile/OS level,
+    # so a missing pak degrades strings in a non-English locale rather than the
+    # browser itself (deliberate divergence from T3's "keep only en-US.pak",
+    # which removed every non-kept child; recorded as a residual risk).
+    [int64]$saved = 0
+    $locales = @(Get-ChildItem -LiteralPath $Root -Recurse -Directory -Filter 'Locales' -ErrorAction SilentlyContinue)
+    if ($locales.Count -eq 0) {
+        Write-Host 'trim: E absent Locales'
+        return $saved
+    }
+    foreach ($loc in $locales) {
+        $paks = @(Get-ChildItem -LiteralPath $loc.FullName -File -Filter '*.pak' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne 'en-US.pak' })
+        if ($paks.Count -eq 0) {
+            Write-Host "trim: E absent $($loc.FullName)\*.pak"
+            continue
+        }
+        foreach ($pak in $paks) {
+            $bytes = [int64]$pak.Length
+            Remove-Item -LiteralPath $pak.FullName -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $pak.FullName) {
+                Write-Host "trim: E FAILED $($pak.FullName) (still present after delete)"
+                continue
+            }
+            $saved = $saved + $bytes
+            Write-Host "trim: E removed $($pak.FullName)"
+        }
+    }
+    return $saved
 }
 
 function Resolve-ChromePlusDll([string]$source, [string]$workDir) {
@@ -335,6 +429,34 @@ try {
         exit 1
     }
 
+    # ------------------------------------------- stage 3b: trim vendor bloat
+    # Groups A, C, D and E were measured SAFE against the baseline (page dump,
+    # WebGL and Widevine EME all alive) by T3 in probe/claims/t-trim.ps1 (run
+    # 36664258871, verdicts recorded in docs/issue1-claims-findings.md); group B
+    # was measured BROKEN, so the Flutter component directory is never a trim
+    # target. C/D sit under the versioned Yandex\<ver>\ dir on a real tree,
+    # which is why they are discovered recursively, while A is trimmed at the
+    # app-dir root only - exactly the paths T3 deleted. This stage runs AFTER the
+    # flat-CDM move so CDM layout and detection stay unaffected.
+    # -KeepVendorBloat reverts to the untrimmed vendor tree.
+    $trimLines = @()
+    if ($KeepVendorBloat) {
+        $trimLines += 'trim: skipped -KeepVendorBloat'
+        Write-Host 'trim: skipped (KeepVendorBloat) - vendor tree left exactly as shipped'
+    }
+    else {
+        [int64]$trimSaved = 0
+        $trimSaved = $trimSaved + (Remove-TrimGroup -Root $yandexDir -Name 'A' -Filter 'clidmgr.exe' -RootOnly)
+        $trimSaved = $trimSaved + (Remove-TrimGroup -Root $yandexDir -Name 'A' -Filter 'browser_proxy.exe' -RootOnly)
+        $trimSaved = $trimSaved + (Remove-TrimGroup -Root $yandexDir -Name 'A' -Filter 'clids_*.xml' -RootOnly)
+        $trimSaved = $trimSaved + (Remove-TrimGroup -Root $yandexDir -Name 'C' -Filter 'voiceactivation' -Directory)
+        $trimSaved = $trimSaved + (Remove-TrimGroup -Root $yandexDir -Name 'D' -Filter 'web_app_config' -Directory)
+        $trimSaved = $trimSaved + (Remove-TrimLocalePaks -Root $yandexDir)
+        $trimLines += 'trim: groups=A,C,D,E'
+        $trimLines += "trim: bytes_saved=$trimSaved"
+        Write-Host "trim: groups A,C,D,E - bytes saved: $trimSaved"
+    }
+
     foreach ($f in 'chrome++.ini', 'debloater.reg', 'update.bat') {
         # Shipped packages carry these inside Yandex\ already (and the update
         # flow treats them as protected), so a missing source here is expected
@@ -450,6 +572,7 @@ try {
     else {
         $manifestLines += 'WidevineCdm=ABSENT (runtime component registration only)'
     }
+    $manifestLines += $trimLines
     Set-Content -Path (Join-Path $OutDir 'layout-manifest.txt') -Value ($manifestLines -join "`n")
     Write-Host "layout: manifest written: $(Join-Path $OutDir 'layout-manifest.txt')"
 }

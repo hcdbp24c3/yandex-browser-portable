@@ -53,7 +53,12 @@ function Compress([string]$cwd, [string[]]$entries, [string]$archive) {
 }
 
 # Branch A fixture: Yandex.exe (7z) -> x_browser/browser.7z -> Browser-bin/...
-# Contains a NESTED WidevineCdm and both updater exes so layout/strip are exercised.
+# Contains a NESTED WidevineCdm and both updater exes so layout/strip are
+# exercised. It also carries the T3 trim targets so the trim stage is actually
+# exercised: group A (clidmgr.exe / browser_proxy.exe / clids_*.xml), group B
+# (widgets\, must survive), groups C/D at BOTH the root and the versioned
+# 26.8.4.893\ placement T3 measured, and group E (Locales\ with three paks plus
+# one non-pak file that must survive the trim).
 function New-FixtureBranchA([string]$root) {
     $inner = Join-Path $root 'inner-src'
     New-Tree $inner @{
@@ -64,6 +69,24 @@ function New-FixtureBranchA([string]$root) {
         'Browser-bin/26.8.4.893/WidevineCdm/manifest.json' = '{"name":"widevine-cdm"}'
         'Browser-bin/service_update.exe'             = 'updater'
         'Browser-bin/yupdate-exec.exe'               = 'updater'
+        # --- T3 trim targets (group A) ---
+        'Browser-bin/clidmgr.exe'                    = 'clid-manager'
+        'Browser-bin/clids_yandex_second.xml'        = '<clid/>'
+        # group A is root-level ONLY (the exact set T3 deleted): a versioned copy
+        # must survive so a future versioned placement is never trimmed unmeasured.
+        'Browser-bin/26.8.4.893/clidmgr.exe'         = 'versioned-clid-manager'
+        # --- group B: never trimmed (T3 measured BROKEN) ---
+        'Browser-bin/widgets/widget.dll'             = 'widget-component'
+        # --- group C/D: root-level AND versioned placement ---
+        'Browser-bin/voiceactivation/voice_activation.dat'         = 'voice-activation'
+        'Browser-bin/26.8.4.893/voiceactivation/voice_activation.dat' = 'voice-activation'
+        'Browser-bin/web_app_config/web_apps.json'     = '{"apps":[]}'
+        'Browser-bin/26.8.4.893/web_app_config/web_apps.json' = '{"apps":[]}'
+        # --- group E: Locales\ with >=3 paks + one non-pak survivor ---
+        'Browser-bin/Locales/en-US.pak'              = 'pak-en-us'
+        'Browser-bin/Locales/ru.pak'                 = 'pak-ru'
+        'Browser-bin/Locales/de.pak'                 = 'pak-de'
+        'Browser-bin/Locales/README.txt'             = 'locale notes'
     }
     $innerArch = Join-Path $root 'browser.7z'
     Compress $inner @('Browser-bin') $innerArch
@@ -359,6 +382,92 @@ Installers:
     $srcSha = Get-Content $builder -Raw
     Assert ($srcSha -match 'Assert-InstallerSha256') 'T15 -Download path calls Assert-InstallerSha256 after the download'
 }
+
+Write-Host '== T16: default-on trim of the T3-safe vendor groups A/C/D/E =='
+$out16 = Join-Path $work 'out16'
+$r16 = Invoke-Builder @('-Installer', $fixA, '-Version', $Version, '-OutDir', $out16, '-ChromePlusUrl', $fixCpp)
+Assert ($r16.ExitCode -eq 0) "T16 builder exits 0 on a default (trim-on) run (got $($r16.ExitCode))"
+$p16 = Get-TreePaths $out16
+Assert (-not ($p16 -contains 'Yandex/clidmgr.exe')) 'T16 group A removes Yandex\clidmgr.exe'
+Assert (-not ($p16 -contains 'Yandex/browser_proxy.exe')) 'T16 group A removes Yandex\browser_proxy.exe'
+$clidLeft = @($p16 | Where-Object { $_ -match '^Yandex/clids_.*\.xml$' })
+Assert ($clidLeft.Count -eq 0) "T16 group A removes EVERY root-level Yandex\clids_*.xml (left: $($clidLeft -join ','))"
+Assert ($p16 -contains 'Yandex/26.8.4.893/clidmgr.exe') 'T16 group A is ROOT-LEVEL only - a versioned clidmgr.exe is never trimmed (not covered by the T3 verdict)'
+Assert (-not ($p16 -contains 'Yandex/voiceactivation')) 'T16 group C removes the root-level Yandex\voiceactivation\'
+Assert (-not ($p16 -contains 'Yandex/26.8.4.893/voiceactivation')) 'T16 group C removes the VERSIONED Yandex\26.8.4.893\voiceactivation\ (the path T3 actually measured)'
+Assert (-not ($p16 -contains 'Yandex/web_app_config')) 'T16 group D removes the root-level Yandex\web_app_config\'
+Assert (-not ($p16 -contains 'Yandex/26.8.4.893/web_app_config')) 'T16 group D removes the VERSIONED Yandex\26.8.4.893\web_app_config\ (the path T3 actually measured)'
+Assert ($p16 -contains 'Yandex/Locales/en-US.pak') 'T16 group E keeps Yandex\Locales\en-US.pak'
+Assert (-not ($p16 -contains 'Yandex/Locales/ru.pak')) 'T16 group E removes Yandex\Locales\ru.pak'
+Assert (-not ($p16 -contains 'Yandex/Locales/de.pak')) 'T16 group E removes Yandex\Locales\de.pak'
+Assert ($p16 -contains 'Yandex/Locales/README.txt') 'T16 group E KEEPS non-pak files in Locales\ (deliberate divergence from T3 "keep only en-US")'
+Assert ($p16 -contains 'Yandex/widgets/widget.dll') 'T16 group B is NEVER trimmed (T3 measured widgets\ BROKEN)'
+Assert ($p16 -contains 'Yandex/browser.exe') 'T16 browser.exe survives the trim'
+Assert ($p16 -contains 'Yandex/WidevineCdm/manifest.json') 'T16 flat WidevineCdm survives the trim'
+Assert ($p16 -contains 'Yandex/version.dll') 'T16 Chrome++ version.dll survives the trim'
+foreach ($g in 'A', 'C', 'D', 'E') {
+    Assert ($r16.Output -match "trim: $g removed") "T16 trim log records a per-target 'trim: $g removed <path>' line"
+}
+$m16 = Join-Path $out16 'layout-manifest.txt'
+$m16text = ''
+if (Test-Path $m16) { $m16text = Get-Content $m16 -Raw }
+Assert ($m16text -match '(?m)^trim: groups=A,C,D,E$') 'T16 layout-manifest records the exact line trim: groups=A,C,D,E'
+$saved16 = [regex]::Match($m16text, '(?m)^trim: bytes_saved=(\d+)$')
+Assert ($saved16.Success -and ([int64]$saved16.Groups[1].Value -gt 0)) "T16 layout-manifest records a positive trim: bytes_saved (got: '$($saved16.Value)')"
+
+Write-Host '== T17: -KeepVendorBloat opt-out removes nothing =='
+$out17 = Join-Path $work 'out17'
+$r17 = Invoke-Builder @('-Installer', $fixA, '-Version', $Version, '-OutDir', $out17, '-ChromePlusUrl', $fixCpp, '-KeepVendorBloat')
+Assert ($r17.ExitCode -eq 0) "T17 builder exits 0 with -KeepVendorBloat (got $($r17.ExitCode))"
+$p17 = Get-TreePaths $out17
+foreach ($keepPath in @(
+        'Yandex/clidmgr.exe', 'Yandex/browser_proxy.exe',
+        'Yandex/clids_yandex.xml', 'Yandex/clids_yandex_second.xml',
+        'Yandex/voiceactivation', 'Yandex/26.8.4.893/voiceactivation',
+        'Yandex/web_app_config', 'Yandex/26.8.4.893/web_app_config',
+        'Yandex/Locales/en-US.pak', 'Yandex/Locales/ru.pak',
+        'Yandex/Locales/de.pak', 'Yandex/Locales/README.txt',
+        'Yandex/widgets/widget.dll')) {
+    Assert ($p17 -contains $keepPath) "T17 -KeepVendorBloat keeps $keepPath"
+}
+Assert (-not ($r17.Output -match 'trim: [A-E] removed')) 'T17 -KeepVendorBloat removes nothing (no per-target trim line)'
+Assert ($r17.Output -match 'trim: skipped \(KeepVendorBloat\)') 'T17 -KeepVendorBloat logs trim: skipped (KeepVendorBloat)'
+$m17 = Join-Path $out17 'layout-manifest.txt'
+$m17text = ''
+if (Test-Path $m17) { $m17text = Get-Content $m17 -Raw }
+Assert ($m17text -match '(?m)^trim: skipped -KeepVendorBloat$') 'T17 layout-manifest records the exact line trim: skipped -KeepVendorBloat'
+Assert ($m17text -notmatch 'bytes_saved') 'T17 layout-manifest has NO bytes_saved line on the opt-out run'
+
+Write-Host '== T18: absent trim groups are logged, never fatal =='
+$out18 = Join-Path $work 'out18'
+$r18 = Invoke-Builder @('-Installer', $fixB, '-Version', $Version, '-OutDir', $out18, '-ChromePlusUrl', $fixCpp)
+Assert ($r18.ExitCode -eq 0) "T18 builder exits 0 when EVERY trim group is absent (got $($r18.ExitCode))"
+foreach ($g in 'A', 'C', 'D', 'E') {
+    Assert ($r18.Output -match "trim: $g absent") "T18 missing group $g is logged as absent, not fatal"
+}
+Assert (-not ($r18.Output -match 'trim: [A-E] removed')) 'T18 nothing is removed from a tree shipping no trim targets'
+$m18 = Join-Path $out18 'layout-manifest.txt'
+$m18text = ''
+if (Test-Path $m18) { $m18text = Get-Content $m18 -Raw }
+Assert ($m18text -match '(?m)^trim: groups=A,C,D,E$') 'T18 absent groups still record trim: groups=A,C,D,E'
+Assert ($m18text -match '(?m)^trim: bytes_saved=0$') 'T18 absent groups record trim: bytes_saved=0'
+
+Write-Host '== T19: trim stage ordering + param source invariants =='
+$srcTrim = Get-Content $builder -Raw
+$iCdmGuard  = $srcTrim.IndexOf('$badCdm')
+$iTrimStage = $srcTrim.IndexOf('stage 3b: trim vendor bloat')
+$iManifest  = $srcTrim.IndexOf('$manifestLines = @(')
+Assert (($iCdmGuard -ge 0) -and ($iTrimStage -gt $iCdmGuard)) `
+    "T19 trim stage runs AFTER the flat-CDM guard (badCdm=$iCdmGuard, trim=$iTrimStage)" `
+    "T19 trim stage index ($iTrimStage) > flat-CDM guard index ($iCdmGuard)"
+Assert (($iTrimStage -ge 0) -and ($iManifest -gt 0) -and ($iTrimStage -lt $iManifest)) `
+    "T19 trim stage runs BEFORE the manifest write, so the manifest can record it (trim=$iTrimStage, manifest=$iManifest)" `
+    "T19 trim stage index ($iTrimStage) < manifest index ($iManifest)"
+Assert ((Select-String -Path $builder -Pattern '\[switch\]\$KeepVendorBloat' -Quiet) -eq $true) 'T19 build-yandex.ps1 declares the [switch]$KeepVendorBloat param'
+Assert ((Select-String -Path $builder -Pattern 'function\s+Remove-TrimGroup' -Quiet) -eq $true) 'T19 build-yandex.ps1 exposes the Remove-TrimGroup helper'
+$codeOnly = @(Get-Content $builder | Where-Object { $_ -notmatch '^\s*#' })
+Assert (-not ($codeOnly -match 'Remove-TrimGroup.*widgets|-Filter.*widgets')) `
+    'T19 no executable builder line names widgets as a trim target (plan Verify code-only grep)'
 
 # ------------------------------------------------------------------ report --
 
