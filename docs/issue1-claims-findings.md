@@ -517,36 +517,42 @@ verdicts is posted:
 
 ## Owner decisions
 
-**PENDING — awaiting the repository owner.** No adoption is implemented in this
-task; the three questions below are open. Each will be recorded here
-(accepted / declined, with rationale) by a follow-up edit once answered, and any
-accepted item gets its own follow-up feature (plan Non-Goals: adoption is split
-out of the testing feature).
+**ANSWERED 2026-09-30 by the repository owner.** Decisions are recorded below;
+the two accepted items are implemented in a follow-up feature
+(`yandex-adopt-trim-launcher`) per the plan's Non-Goals adoption split — this
+testing feature adopted nothing itself.
 
 **Question (a) — HKCU dual-root in `debloater.reg`.** Should `debloater.reg`
 gain a `HKEY_CURRENT_USER\Software\Policies\YandexBrowser` root alongside the
 existing `HKEY_LOCAL_MACHINE\SOFTWARE\Policies\YandexBrowser` root (write both,
 non-admin fallback)?
-*Status:* **MOOT unless a future probe re-checks.** T1 came back `IGNORED` — the
-two real policy names written to HKCU never appeared in `chrome://policy` — so
-today there is no evidence that a HKCU root is honoured at runtime. The launcher
-already implements the full ephemeral HKCU lifecycle behind this gate: it reads
-the `T1 verdict:` line from this file and writes nothing at all while that
-verdict is anything other than `HONORED`.
+*Decision:* **NOT ADOPTED (moot).** T1 came back `IGNORED` — the two real policy
+names written to HKCU never appeared in `chrome://policy` — so there is no
+evidence a HKCU root is honoured at runtime. `debloater.reg` keeps its single
+HKLM root. The launcher's ephemeral HKCU lifecycle stays implemented but
+permanently gated: it reads the `T1 verdict:` line from this file and writes
+nothing at all while that verdict is anything other than `HONORED`, so shipping
+the launcher grants it no policy write path today. A future probe that flips T1
+to `HONORED` reopens this decision.
 
 **Question (b) — proven-safe trim groups.** Should `build-yandex.ps1` adopt the
 proven-safe trim groups **A / C / D / E** (`clidmgr.exe`, `browser_proxy.exe`,
 `clids_*.xml`; `voiceactivation\`; `web_app_config\`; `Locales\` reduced to
 `en-US.pak`) for 14.06 MB (2.73 % of the payload), with group **B**
 (`widgets\`) explicitly retained because it breaks Dump/WebGL/EME?
-*Status:* **OPEN.** Measured SAFE by T3, but T3 measures safety only — adoption is
-an owner decision.
+*Decision:* **ADOPTED 2026-09-30** (owner). Groups **A / C / D / E** go into
+`build-yandex.ps1`; group **B (`widgets\`) is explicitly RETAINED** because T3
+measured it breaking Dump/WebGL/EME. Saves 14.06 MB (2.73 %). Implementation
+tracked in the follow-up feature `yandex-adopt-trim-launcher`.
 
 **Question (c) — ship the launcher in the release zip.** Should the compiled
 `launcher.exe` be added to the `.github/workflows/build.yml` release zip?
-*Status:* **OPEN.** The launcher is deliberately **not** in the zip today. Shipping
-it also means the end user runs a binary that can write `HKCU\Software\Policies`,
-so it should be an explicit owner call, not a side effect of packaging.
+*Decision:* **ADOPTED 2026-09-30** (owner). The compiled `launcher.exe` is added
+to the `build.yml` release zip, with `build.yml` building it (`GOOS=windows`,
+`CGO_ENABLED=0`) and the build/smoke workflows asserting it is present. Note the
+HKCU-write capability is inert per decision (a) — the launcher ships in
+skip mode. Implementation tracked in the follow-up feature
+`yandex-adopt-trim-launcher`.
 
-*Answers are not yet recorded.* Until they are, nothing in this document claims
-owner approval for any adoption.
+*All three questions are answered.* Adoption is implemented in a separate feature;
+this document records the decisions and the evidence behind them only.
