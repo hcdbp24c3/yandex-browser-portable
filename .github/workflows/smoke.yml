@@ -5,6 +5,7 @@ name: "Windows Smoke (policy + EME + update flow)"
 #   A - layout: resolve the latest yandex-portable_*.zip release, download and
 #       extract it, assert the shipped layout (browser.exe, chrome++.ini,
 #       debloater.reg, version.txt == tag, package-root build-yandex.ps1,
+#       package-root launcher.exe + its docs\issue1-claims-findings.md T1 gate,
 #       updater stripped, flat CDM rule).
 #   B - policy + EME: reg import debloater.reg (runner is admin), dump the
 #       policy page, hard-fail unless ALL 11 keys are present, then run the
@@ -14,7 +15,14 @@ name: "Windows Smoke (policy + EME + update flow)"
 #       stdin (CWD = the bat's own directory), then assert exit 0, version
 #       bump, protected files unchanged, Data\ intact, 11 keys still applied
 #       and re-run the EME probe.
-#   D - verdict (if: always): read the result files -> summary.md -> step
+#   E - shipped launcher: run the released launcher.exe from the package root
+#       (CWD matters - --findings is a relative default) with --lang pinned.
+#       --settings prints the EN + RU tables, --dry-run --selftest walks mutex
+#       -> T1 mode -> prune -> launch plan, and HKCU\Software\Policies\
+#       YandexBrowser must be absent BEFORE and AFTER (T1 verdict is IGNORED,
+#       so skip mode writes nothing). Runs after C because update.bat rebuilds
+#       and re-copies the tree; phase E owns state.json on that tree.
+#   Verdict (if: always): read the result files -> summary.md -> step
 #       summary + console, Result: PASSED / FAILED, exit 1 on failure.
 #
 # Measurement notes (docs/spike-findings.md):
@@ -622,6 +630,11 @@ jobs:
           if (Test-Path "$app/version.txt") { $vt = (Get-Content "$app/version.txt" -Raw).Trim() }
           Assert ($vt -eq $ver) "layout: version.txt == tag version ($vt == $ver)"
           Assert (Test-Path "$root/build-yandex.ps1") "layout: package-root build-yandex.ps1 present"
+          # The T9 launcher ships at the package root and its T1-verdict gate
+          # doc beside it: without docs\issue1-claims-findings.md the launcher
+          # hard-exits 1 (launcher/mode.go), so both are layout invariants.
+          Assert (Test-Path "$root\launcher.exe") "layout: package-root launcher.exe present (T9 launcher)"
+          Assert (Test-Path "$root\docs\issue1-claims-findings.md") "layout: package-root docs\issue1-claims-findings.md present (launcher T1 gate)"
           Assert (Test-Path "$app/update.bat") "layout: Yandex/update.bat present (needed by phase C)"
           $up = @(Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
                   Where-Object { $_.Name -eq 'service_update.exe' -or $_.Name -eq 'yupdate-exec.exe' })
@@ -925,6 +938,84 @@ jobs:
           Set-Content "$env:SMOKE/c.txt" 'STATUS=OK'
           exit 0
 
+      # Phase E runs right after phase C on a package whose Data\ was never
+      # populated by a Chrome++-redirected launch (phase A moves version.dll
+      # aside and every probe passes an explicit --user-data-dir), so the only
+      # T7 volatile dirs are the ones phase E itself is about to prune: the
+      # fresh-package count is deterministically 0.
+      - name: "Phase E - shipped launcher (settings, selftest, prune)"
+        id: phaseE
+        run: |
+          Set-Content "$env:SMOKE/e.txt" 'STATUS=RUNNING'
+          $fail = [System.Collections.Generic.List[string]]::new()
+          function Assert([bool]$cond, [string]$msg) {
+            if ($cond) { "PASS: $msg" | Add-Content "$env:SMOKE/summary.md" }
+            else { "FAIL: $msg" | Add-Content "$env:SMOKE/summary.md"; $script:fail.Add($msg) }
+          }
+          $root = "$env:SMOKE/fresh/Yandex_Portable"
+          $launcher = Join-Path $root 'launcher.exe'
+          $stateStamp = Join-Path $root 'state.json'
+          function Invoke-Launcher([string]$label, [string[]]$argv) {
+            $out = Join-Path $env:SMOKE "launcher-$label-out.txt"
+            $err = Join-Path $env:SMOKE "launcher-$label-err.txt"
+            # WorkingDirectory = package root: --findings defaults to the
+            # RELATIVE docs/issue1-claims-findings.md, so any other CWD turns
+            # the shipped launcher into a hard exit 1.
+            $p = Start-Process -FilePath $launcher -ArgumentList $argv -WorkingDirectory $root -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $err
+            $text = ''
+            if (Test-Path $out) { $text = Get-Content $out -Raw -ErrorAction SilentlyContinue }
+            if ($null -eq $text) { $text = '' }
+            if (Test-Path $out) { Get-Content $out | Write-Host }
+            return @{ Code = $p.ExitCode; Text = $text }
+          }
+
+          "" | Add-Content "$env:SMOKE/summary.md"
+          "## Launcher (phase E, shipped launcher.exe)" | Add-Content "$env:SMOKE/summary.md"
+
+          # A running browser always wins over the prune (platform_windows.go
+          # browserRunning), and phase C leaves stop/start races behind.
+          Stop-Process -Name browser, browser_proxy -Force -ErrorAction SilentlyContinue
+
+          # The shipped T1 verdict is IGNORED, so the launcher runs in skip
+          # mode and must leave HKCU alone. Snapshot the key BEFORE and AFTER
+          # (never assert that a write happens - plan Must-NOT).
+          $hkcuKey = 'HKCU:\Software\Policies\YandexBrowser'
+          $hkcuBefore = Test-Path -LiteralPath $hkcuKey
+
+          # --lang is pinned: the RU table renders different literals, so an
+          # unpinned grep would ride the runner's UI language.
+          $setEn = Invoke-Launcher 'settings-en' @('--settings', '--lang', 'en')
+          Assert ($setEn.Code -eq 0) "launcher: --settings --lang en exits 0 (got $($setEn.Code))"
+          Assert ($setEn.Text.Contains('config:')) 'launcher: --settings --lang en prints the config: header'
+          Assert ($setEn.Text.Contains('  language: en')) 'launcher: --settings --lang en reports language: en'
+          Assert ($setEn.Text.Contains('  hkcu-mode: skip - T1 verdict: IGNORED')) `
+            'launcher: --settings reports the skip mode with the exact T1 verdict reason'
+
+          $self = Invoke-Launcher 'selftest' @('--dry-run', '--selftest')
+          Assert ($self.Code -eq 0) "launcher: --dry-run --selftest exits 0 (got $($self.Code))"
+          Assert ($self.Text.Contains('selftest: start')) 'launcher: selftest printed its start line'
+          Assert ($self.Text.Contains('selftest: ok - all checks passed')) 'launcher: selftest reported all checks passed'
+          Assert ($self.Text.Contains('mutex: acquired')) 'launcher: selftest acquired the single-instance mutex'
+          Assert ($self.Text.Contains('mode: skip - T1 verdict: IGNORED')) 'launcher: selftest ran in skip mode (T1 verdict IGNORED)'
+          Assert ($self.Text.Contains('prune: executed - removed 0 dir(s)')) `
+            'launcher: fresh package prunes 0 dirs (no state.json -> stale -> executed)'
+          Assert (Test-Path -LiteralPath $stateStamp) 'launcher: prune wrote state.json at the package root'
+          Assert ($self.Text.Contains('prune: state.json written')) 'launcher: selftest logged the state.json stamp'
+
+          $setRu = Invoke-Launcher 'settings-ru' @('--settings', '--lang', 'ru')
+          Assert ($setRu.Code -eq 0) "launcher: --settings --lang ru exits 0 (got $($setRu.Code))"
+
+          $hkcuAfter = Test-Path -LiteralPath $hkcuKey
+          Assert ((-not $hkcuBefore) -and (-not $hkcuAfter)) `
+            "launcher: HKCU\Software\Policies\YandexBrowser absent before and after skip mode (before=$hkcuBefore, after=$hkcuAfter)"
+
+          if ($fail.Count -gt 0) {
+            Set-Content "$env:SMOKE/e.txt" 'STATUS=FAIL'
+            throw "Phase E failed: $($fail -join '; ')"
+          }
+          Set-Content "$env:SMOKE/e.txt" 'STATUS=OK'
+          exit 0
+
       - name: "Verdict - policy, EME and update flow"
         id: verdict
         if: always()
@@ -951,6 +1042,7 @@ jobs:
           $stA = Read-Status (Join-Path $env:SMOKE 'a.txt')
           $stB = Read-Status (Join-Path $env:SMOKE 'b.txt')
           $stC = Read-Status (Join-Path $env:SMOKE 'c.txt')
+          $stE = Read-Status (Join-Path $env:SMOKE 'e.txt')
           $emeA = Read-Eme (Join-Path $env:SMOKE 'emeA.txt')
           $emeB = Read-Eme (Join-Path $env:SMOKE 'emeB.txt')
           $missingKeys = @()
@@ -965,7 +1057,7 @@ jobs:
           $fails = @()
           "" | Add-Content $summary
           "## Phase status" | Add-Content $summary
-          "- A layout: $stA; B policy+EME: $stB; C update e2e: $stC" | Add-Content $summary
+          "- A layout: $stA; B policy+EME: $stB; C update e2e: $stC; E launcher: $stE" | Add-Content $summary
           "## Policy keys (browser://policy dump)" | Add-Content $summary
           if (Test-Path $policyFile) {
             if ($missingKeys.Count -eq 0) {
@@ -986,7 +1078,7 @@ jobs:
           if (($emeA -ne 'MISSING') -and ($emeA -ne 'CDM_OK')) {
             "- EME WARN: baseline is '$emeA' (spike P4 recorded FAIL) - not failing per the spike-P4 rule" | Add-Content $summary
           }
-          foreach ($ph in @(@('A', $stA), @('B', $stB), @('C', $stC))) {
+          foreach ($ph in @(@('A', $stA), @('B', $stB), @('C', $stC), @('E', $stE))) {
             $st = $ph[1]
             if ($st -eq 'OK') { continue }
             if ($st -eq 'MISSING') { $fails += "PHASE $($ph[0]) MISSING (earlier step died before it started)" }

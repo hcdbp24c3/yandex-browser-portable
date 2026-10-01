@@ -73,7 +73,22 @@ Accepts either the package root or the `Yandex\` dir:
 <pkg>/state.json                (prune stamp)
 ```
 
-## Out of scope
+## Packaging
 
-The launcher is **not** added to the `build.yml` zip — packaging is Task 3's
-owner decision.
+`build.yml` compiles this launcher into the release zip and ships, beside it at the
+package root, the gate document it reads:
+
+```
+Yandex_Portable/launcher.exe
+Yandex_Portable/docs/issue1-claims-findings.md
+```
+
+The `-o` target is `../Yandex_Portable/launcher.exe` **on purpose**: the zip only
+archives the `Yandex_Portable` directory, so a repo-root binary would satisfy a naive
+`Test-Path` and ship nothing. Run it from the package root — `--findings` defaults to the
+relative `docs/issue1-claims-findings.md`.
+
+`smoke.yml` Phase E runs the **released** binary (Phase A asserts both files are in the
+zip) with CWD = package root: `--settings --lang en`, `--settings --lang ru` and
+`--dry-run --selftest`. It asserts `HKCU\Software\Policies\YandexBrowser` is absent
+before *and* after, because the shipped `T1 verdict:` is `IGNORED` → skip mode.

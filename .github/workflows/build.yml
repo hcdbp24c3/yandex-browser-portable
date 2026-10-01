@@ -96,6 +96,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same incantation claims.yml T9 uses: the toolchain comes from
+      # launcher/go.mod, the module cache is keyed on launcher/go.sum.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: launcher/go.mod
+          cache-dependency-path: launcher/go.sum
+
       - name: Build package
         run: |
           $ver = "${{ needs.check.outputs.yandex_ver }}"
@@ -105,6 +113,47 @@ jobs:
             Write-Error "build-yandex.ps1 failed with exit code $LASTEXITCODE"
             exit 1
           }
+
+      # The launcher MUST land inside $pkg: the zip step only archives the
+      # Yandex_Portable directory, so a repo-root binary would pass a naive
+      # Test-Path and ship nothing. Plain `go build` (no -trimpath / -ldflags)
+      # is the exact incantation T9 measured.
+      - name: Build launcher
+        run: |
+          $pkg = "Yandex_Portable"
+
+          Push-Location launcher
+          try {
+            go vet ./...
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "go vet failed with exit code $LASTEXITCODE"
+              exit 1
+            }
+            go build -o "../Yandex_Portable/launcher.exe" .
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "go build failed with exit code $LASTEXITCODE"
+              exit 1
+            }
+          }
+          finally { Pop-Location }
+
+          if (-not (Test-Path (Join-Path $pkg 'launcher.exe'))) {
+            Write-Error "launcher.exe not produced at $pkg\launcher.exe"
+            exit 1
+          }
+
+          # The launcher resolves its T1 verdict from the RELATIVE default
+          # docs/issue1-claims-findings.md, and a missing doc is a HARD error
+          # (launcher/mode.go), so the gate doc ships inside the package too.
+          $findings = "docs/issue1-claims-findings.md"
+          if (-not (Test-Path -LiteralPath $findings)) {
+            Write-Error "findings doc missing from the repo: $findings"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path (Join-Path $pkg 'docs') | Out-Null
+          Copy-Item -LiteralPath $findings -Destination (Join-Path $pkg 'docs/issue1-claims-findings.md') -Force
+
+          Write-Host "packaged: launcher.exe + docs\issue1-claims-findings.md"
 
       - name: Layout asserts
         run: |
@@ -117,6 +166,8 @@ jobs:
             "Yandex\debloater.reg",
             "Yandex\version.txt",
             "build-yandex.ps1",
+            "launcher.exe",
+            "docs\issue1-claims-findings.md",
             "preseed\Local State",
             "preseed\Preferences",
             "preseed\First Run"

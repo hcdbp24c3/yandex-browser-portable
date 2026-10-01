@@ -38,10 +38,36 @@ Delivered in https://github.com/hcdbp24c3/yandex-browser-portable (release
   `service_update.exe`, and re-imports `debloater.reg`.
 - **CI** — `validate.yml` (pins on every push), `build.yml` (check → build → release,
   fail-closed exists-gate, no duplicate publishes), `smoke.yml` (layout + 11-key policy
-  check + EME probe + `update.bat` e2e → `Result: PASSED`), `spike.yml` (feasibility
-  probe, kept for re-runs).
-- **Tests** — `tests/build-yandex.tests.ps1` (70 assertions) and
-  `tests/update.tests.ps1` (83 assertions), both green.
+  check + EME probe + `update.bat` e2e + shipped-launcher phase → `Result: PASSED`),
+  `claims.yml` (the issue #1 claim probes T1–T9), `spike.yml` (feasibility probe, kept
+  for re-runs).
+- **Tests** — `tests/build-yandex.tests.ps1` (187 assertions),
+  `tests/update.tests.ps1` (90) and `tests/claims.tests.ps1` (107), all green and run on
+  every push by `validate.yml`; `go vet ./...` + `go test ./...` in `launcher/`.
+
+## Adoption 2026-10-01 — vendor trim + single-instance launcher
+
+Two things from issue #1 were adopted into the shipping package after the claim probes
+settled them. Decisions and evidence:
+[`docs/issue1-claims-findings.md`](issue1-claims-findings.md) (the per-section verdicts and
+the owner-decision block) and the comment on
+[issue #1](https://github.com/hcdbp24c3/yandex-browser-portable/issues/1).
+
+1. **Vendor trim (default-on).** `build-yandex.ps1` now removes the groups T3 measured
+   **safe** — A (root-level `clidmgr.exe` / `browser_proxy.exe` / `clids_*.xml`), C
+   (`voiceactivation\`), D (`web_app_config\`), E (`Locales\*.pak` except `en-US.pak`) —
+   and **never** the Flutter component directory, which T3 measured broken
+   (dump/WebGL/EME all regressed). ~14.06 MB of a 515 MB payload. `-KeepVendorBloat` is
+   the escape hatch; `layout-manifest.txt` records `trim: groups=A,C,D,E` +
+   `trim: bytes_saved=<n>` (or `trim: skipped -KeepVendorBloat`).
+2. **`launcher.exe` ships in the release zip.** `build.yml` compiles the Go launcher and
+   its T1-verdict gate doc straight into the package (`launcher.exe` +
+   `docs\issue1-claims-findings.md` at the package root) before `Compress-Archive`, and
+   `smoke.yml` exercises the **released** binary in a new Phase E: `--settings --lang
+   en|ru` (two invocations — one cannot print both tables) and `--dry-run --selftest`
+   with CWD = package root. The shipped T1 verdict is `IGNORED`, so the launcher runs in
+   skip mode and `HKCU\Software\Policies\YandexBrowser` must be absent **before and
+   after** the run — the smoke asserts the absence, never a write.
 
 **Not** shipped, by explicit decision: no Corporate-MSI automation (login-gated), no
 Yandex ID/sync, no Management Console integration, no bundled certificates, no
@@ -145,6 +171,21 @@ present pre- and post-update**, EME reported WARN per the spike-P4 rule, exit co
    which is limited to **60 requests/hour per IP** — users behind a shared/corporate NAT
    may see update failures from rate limiting. Mitigation: set a `GITHUB_TOKEN`
    environment variable before running `Yandex\update.bat` (the updater honors it).
+8. **The vendor trim is BUILD-TIME only — the 14 MB figure applies to fresh installs.**
+   `update.bat` rebuilds into a temp directory and copies over **without deleting**
+   (`Copy-UpdatedFiles`), so an install that has already been updated keeps its
+   `clidmgr.exe`, `browser_proxy.exe`, `clids_*.xml` and the non-`en-US` locale `.pak`
+   files. Users who want the saving re-extract a fresh release (or delete those files
+   themselves). The trim never re-applies in place, by design — a copy-over that deleted
+   unknown files would be far more dangerous than the leftover bytes.
+9. **Group E keeps non-`.pak` files in `Locales\` (divergence from the T3 probe).** T3
+   deleted *every* child that was not `en-US.pak`; the builder keeps any non-`.pak` file
+   instead. Rationale: the measured failure mode of an over-aggressive locale trim is
+   "missing UI strings in a non-English locale", not a broken browser (T8 rendered fine
+   with `Locales=[en-US.pak]`), so the package keeps the extra non-language files at a
+   negligible cost. Likewise **group A is root-level only** — a versioned
+   `Yandex\<ver>\clidmgr.exe` is never trimmed, because no measurement ever proved a
+   versioned copy safe.
 
 ## Links
 

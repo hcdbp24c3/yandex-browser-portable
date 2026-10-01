@@ -469,6 +469,131 @@ $codeOnly = @(Get-Content $builder | Where-Object { $_ -notmatch '^\s*#' })
 Assert (-not ($codeOnly -match 'Remove-TrimGroup.*widgets|-Filter.*widgets')) `
     'T19 no executable builder line names widgets as a trim target (plan Verify code-only grep)'
 
+Write-Host '== T20: build.yml ships launcher.exe + the findings doc INSIDE the package =='
+$buildYml = Join-Path $repoRoot '.github/workflows/build.yml'
+$buildSrc = Get-Content $buildYml -Raw
+$iGoSetup = $buildSrc.IndexOf('actions/setup-go@v5')
+# Anchor on the real invocation, not a prose mention of it in a comment.
+$iCompress = $buildSrc.IndexOf('Compress-Archive -Path Yandex_Portable')
+$iLayoutAsserts = $buildSrc.IndexOf('- name: Layout asserts')
+$mGoBuild = [regex]::Match($buildSrc, 'go build -o\s+"([^"]+)"')
+
+Assert ($iGoSetup -ge 0) 'T20 build.yml sets up Go (claims.yml T9 incantation)'
+Assert ($buildSrc -match 'go-version-file:\s*launcher/go\.mod') 'T20 setup-go pins the toolchain from launcher/go.mod'
+Assert ($buildSrc -match 'cache-dependency-path:\s*launcher/go\.sum') 'T20 setup-go caches on launcher/go.sum'
+Assert ($buildSrc -match 'go vet \./\.\.\.') 'T20 build.yml runs go vet before the launcher build'
+Assert ($mGoBuild.Success) 'T20 build.yml builds the launcher with an explicit -o target'
+# The zip is `Compress-Archive -Path Yandex_Portable`, so a repo-root binary
+# would pass a naive Test-Path and ship NOTHING. Pin the -o target.
+Assert ($mGoBuild.Groups[1].Value -like '*Yandex_Portable*') `
+    "T20 launcher -o target lands inside the zipped package dir (got '$($mGoBuild.Groups[1].Value)')"
+Assert ($mGoBuild.Groups[1].Value -ne 'launcher.exe') `
+    'T20 launcher is never built to a bare repo-root launcher.exe (it would not ship)'
+Assert (($iGoSetup -ge 0) -and ($iCompress -gt $iGoSetup)) `
+    "T20 setup-go runs BEFORE Compress-Archive (setup-go=$iGoSetup, compress=$iCompress)"
+Assert ($mGoBuild.Success -and ($iCompress -gt $mGoBuild.Index)) `
+    "T20 the launcher is built BEFORE Compress-Archive (go build=$($mGoBuild.Index), compress=$iCompress)"
+Assert ($mGoBuild.Success -and ($iLayoutAsserts -gt $mGoBuild.Index)) `
+    "T20 the launcher is built BEFORE the Layout asserts step, so the assert can see it (go build=$($mGoBuild.Index), asserts=$iLayoutAsserts)"
+Assert ($buildSrc -match [regex]::Escape("Test-Path (Join-Path `$pkg 'launcher.exe')")) `
+    'T20 build.yml Test-Paths launcher.exe inside $pkg (not at the repo root)'
+Assert ($buildSrc -match '(?m)^\s*"launcher\.exe",?\s*$') `
+    'T20 launcher.exe is in the layout-asserts $required list'
+Assert ($buildSrc -match [regex]::Escape('"docs\issue1-claims-findings.md"')) `
+    'T20 the findings doc is in the layout-asserts $required list'
+# Missing findings doc = HARD error (launcher/mode.go), so the shipped exe
+# needs the gate doc beside it inside $pkg.
+Assert ($buildSrc -match 'issue1-claims-findings\.md') 'T20 build.yml ships docs\issue1-claims-findings.md'
+$iCopyDoc = $buildSrc.IndexOf('Copy-Item')
+Assert (($iCopyDoc -ge 0) -and ($iCompress -gt $iCopyDoc)) `
+    "T20 the findings doc is copied INTO the package BEFORE Compress-Archive (copy=$iCopyDoc, compress=$iCompress)"
+
+Write-Host '== T21: smoke.yml Phase A/E asserts + verdict wiring =='
+$smokeYml = Join-Path $repoRoot '.github/workflows/smoke.yml'
+$smokeSrc = Get-Content $smokeYml -Raw
+$iPhaseA  = $smokeSrc.IndexOf('- name: "Phase A - layout asserts"')
+$iPhaseE  = $smokeSrc.IndexOf('- name: "Phase E')
+$iVerdict = $smokeSrc.IndexOf('- name: "Verdict -')
+Assert (($iPhaseA -ge 0) -and ($iPhaseE -gt $iPhaseA)) `
+    "T21 smoke.yml has a Phase E after Phase A (A=$iPhaseA, E=$iPhaseE)"
+Assert (($iPhaseE -ge 0) -and ($iVerdict -gt $iPhaseE)) `
+    "T21 Phase E runs BEFORE the verdict step (E=$iPhaseE, verdict=$iVerdict)"
+# Phase A body = between Phase A and Phase E; Phase E body = Phase E .. verdict.
+$phaseABody = ''
+$phaseEBody = ''
+if (($iPhaseA -ge 0) -and ($iPhaseE -gt $iPhaseA)) { $phaseABody = $smokeSrc.Substring($iPhaseA, $iPhaseE - $iPhaseA) }
+if (($iPhaseE -ge 0) -and ($iVerdict -gt $iPhaseE)) { $phaseEBody = $smokeSrc.Substring($iPhaseE, $iVerdict - $iPhaseE) }
+Assert ($phaseABody -match [regex]::Escape('launcher.exe')) `
+    'T21 Phase A asserts launcher.exe (the release zip is what smoke tests)'
+Assert ($phaseABody -match [regex]::Escape('docs\issue1-claims-findings.md')) `
+    'T21 Phase A asserts the shipped docs\issue1-claims-findings.md (build.yml 2a end-to-end)'
+# --lang must be explicit: the RU table renders different literals, so an
+# unpinned grep would ride the runner's UI language. Anchor on the real
+# Invoke-Launcher call, not on prose that merely mentions the flags.
+Assert ($phaseEBody -match "Invoke-Launcher '[^']+' @\('--settings', '--lang', 'en'\)") `
+    'T21 Phase E invokes --settings with --lang en as explicit argv'
+Assert ($phaseEBody -match "Invoke-Launcher '[^']+' @\('--settings', '--lang', 'ru'\)") `
+    'T21 Phase E also invokes --settings with --lang ru (two-invocation pattern)'
+Assert ($phaseEBody -match "Invoke-Launcher '[^']+' @\('--dry-run', '--selftest'\)") `
+    'T21 Phase E invokes --dry-run --selftest'
+Assert ($phaseEBody -match [regex]::Escape('-WorkingDirectory $root')) `
+    'T21 Phase E runs the launcher with CWD = package root (--findings is a relative default)'
+# Every grep must be a REAL Assert call. Asserting the bare literal would be
+# satisfied by the assertion's own description string (verified: the mutation
+# that dropped --lang en still passed).
+$greps = [ordered]@{
+    'config:'                            = 'the settings title'
+    '  language: en'                     = 'the EN language line'
+    '  hkcu-mode: skip - T1 verdict: IGNORED' = 'the skip mode + T1 verdict reason'
+    'selftest: start'                    = 'the selftest start line'
+    'selftest: ok - all checks passed'   = 'the selftest verdict line'
+    'mutex: acquired'                    = 'the single-instance mutex line'
+    'mode: skip - T1 verdict: IGNORED'   = 'the selftest skip-mode line'
+    'prune: executed - removed 0 dir(s)' = 'the fresh-package prune line'
+    'prune: state.json written'          = 'the state.json stamp log line'
+}
+foreach ($lit in $greps.Keys) {
+    $pat = 'Assert \(\$[A-Za-z]+\.Text\.Contains\(' + [regex]::Escape("'$lit'") + '\)\)'
+    Assert ($phaseEBody -match $pat) "T21 Phase E has a real Assert(...Contains('$lit')) grep for $($greps[$lit])"
+}
+Assert (-not $phaseEBody.Contains('prune: fresh')) `
+    'T21 Phase E never asserts prune: fresh (a fresh package has no state.json, so it is stale)'
+Assert ($phaseEBody -match [regex]::Escape("'state.json'")) 'T21 Phase E asserts the state.json stamp at the package root'
+# Skip mode must leave HKCU untouched - assert the ABSENCE, never a write
+# (plan Must-NOT: smoke must never assert HKCU writes happen).
+Assert ($phaseEBody -match [regex]::Escape('HKCU:\Software\Policies\YandexBrowser')) 'T21 Phase E snapshots the HKCU policy key'
+Assert ($phaseEBody -match 'hkcuBefore' -and $phaseEBody -match 'hkcuAfter') `
+    'T21 Phase E compares the HKCU key before AND after the run'
+Assert (-not ($phaseEBody -match 'policy:\s*applied')) `
+    'T21 Phase E never asserts policy: applied - the shipped T1 verdict is IGNORED, so HKCU stays untouched'
+Assert ($phaseEBody -match 'e\.txt') 'T21 Phase E writes its own result file e.txt'
+Assert ($smokeSrc -match [regex]::Escape("Read-Status (Join-Path `$env:SMOKE 'e.txt')")) `
+    'T21 the verdict step reads e.txt'
+Assert ($smokeSrc -match [regex]::Escape("@('E', `$stE)")) `
+    "T21 the verdict phase array includes E (otherwise a Phase E failure leaves the job green)"
+
+Write-Host '== T22: docs - layout, trim scope, residual risk, refreshed counts =='
+$readme = Get-Content (Join-Path $repoRoot 'README.md') -Raw
+$statusDoc = Get-Content (Join-Path $repoRoot 'docs/2026-09-27-issue8-status.md') -Raw
+Assert ($readme -match '(?m)^.*launcher\.exe.*$') 'T22 README documents launcher.exe'
+Assert ($readme -match 'KeepVendorBloat') 'T22 README documents the -KeepVendorBloat rebuild opt-out'
+Assert ($readme -match 'issue1-claims-findings\.md') 'T22 README documents the shipped findings doc'
+# Trim is BUILD-TIME only: update.bat copies over without deleting, so an
+# already-updated install keeps clidmgr.exe and the extra paks.
+Assert ($readme -match '(?i)build-time') 'T22 README states that the trim is build-time only'
+Assert ($readme -match '(?i)group E') 'T22 README records the group-E divergence'
+foreach ($stale in '70 assertions', '83 assertions') {
+    Assert (-not $readme.Contains($stale)) "T22 README no longer claims the stale count '$stale'"
+}
+foreach ($suite in 'build-yandex.tests.ps1', 'update.tests.ps1', 'claims.tests.ps1') {
+    Assert ($readme -match [regex]::Escape($suite)) "T22 README lists the $suite suite"
+}
+Assert ($statusDoc -match '(?i)adopt') 'T22 the status doc carries an adoption note'
+Assert ($statusDoc -match 'launcher\.exe') 'T22 the status doc records that launcher.exe ships'
+Assert ($statusDoc -match '(?i)build-time') 'T22 the status doc states the trim is build-time only'
+Assert ($statusDoc -match '(?i)group E') 'T22 the status doc records group E as a residual risk'
+Assert ($statusDoc -match 'issue1-claims-findings\.md') 'T22 the status doc links the T1 verdict findings doc'
+
 # ------------------------------------------------------------------ report --
 
 try { Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue } catch { }
